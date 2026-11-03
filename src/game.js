@@ -781,12 +781,36 @@ NetCtor.prototype.host = function (code) {
   return this._waitForPeerJs().then(function (ok) {
     if (!ok) { self.onMessage({ t: 'error', text: 'PeerJS не загрузился.' }); return false; }
     self.isHost = true; self.roomCode = code; self._destroyPeer();
-    self.peer = new window.Peer('atmos-' + code, { debug: 0, config: ICE_CONFIG });
+    try {
+      self.peer = new window.Peer('atmos-' + code, { debug: 0, config: ICE_CONFIG });
+    } catch(e) {
+      self.onMessage({ t: 'error', text: 'Сеть: не удалось создать соединение' });
+      return false;
+    }
     self.peer.on('open', function () { self.onOpen(); });
-    self.peer.on('error', function (e) { self.onMessage({ t: 'error', text: 'Сеть: ' + (e.type || 'ошибка') }); });
+    self.peer.on('error', function (e) { 
+      console.error('[peer host error]', e.type, e);
+      if (e.type === 'unavailable-id') {
+        self.onMessage({ t: 'error', text: 'Код комнаты занят. Попробуйте другой.' });
+      } else if (e.type === 'network') {
+        self.onMessage({ t: 'error', text: 'Проблема с сетью. Проверьте подключение.' });
+      } else if (e.type === 'server-error' || e.type === 'socket-error' || e.type === 'socket-closed') {
+        self.onMessage({ t: 'error', text: 'Сервер PeerJS недоступен. Попробуйте позже.' });
+      } else {
+        self.onMessage({ t: 'error', text: 'Сеть: ' + (e.type || 'ошибка') }); 
+      }
+    });
     self.peer.on('connection', function (conn) {
       if (self.conn && self.conn.open) { try { conn.close(); } catch (e) {} return; }
       self.conn = conn; self._wire(conn);
+    });
+    self.peer.on('disconnected', function() {
+      console.log('[peer] disconnected, trying to reconnect...');
+      try {
+        if (self.peer && !self.peer.destroyed) {
+          self.peer.reconnect();
+        }
+      } catch(e) {}
     });
     return true;
   });
@@ -796,12 +820,51 @@ NetCtor.prototype.join = function (code) {
   return this._waitForPeerJs().then(function (ok) {
     if (!ok) { self.onMessage({ t: 'error', text: 'PeerJS не загрузился.' }); return false; }
     self.isHost = false; self.roomCode = code; self._destroyPeer();
-    self.peer = new window.Peer({ debug: 0, config: ICE_CONFIG });
+    try {
+      self.peer = new window.Peer({ debug: 0, config: ICE_CONFIG });
+    } catch(e) {
+      self.onMessage({ t: 'error', text: 'Сеть: не удалось создать соединение' });
+      return false;
+    }
+    var tried = 0;
     self.peer.on('open', function () {
-      var conn = self.peer.connect('atmos-' + code, { reliable: true });
+      var conn = self.peer.connect('atmos-' + code, { reliable: true, serialization: 'json' });
       self.conn = conn; self._wire(conn);
+      // Таймаут на подключение
+      setTimeout(function() {
+        if (!self.conn || !self.conn.open) {
+          if (tried < 2) {
+            tried++;
+            console.log('[net] retry connect attempt', tried);
+            try {
+              if (self.conn) self.conn.close();
+              var conn2 = self.peer.connect('atmos-' + code, { reliable: true, serialization: 'json' });
+              self.conn = conn2; self._wire(conn2);
+            } catch(e) {}
+          }
+        }
+      }, 3000);
     });
-    self.peer.on('error', function (e) { self.onMessage({ t: 'error', text: 'Сеть: ' + (e.type || 'ошибка') }); });
+    self.peer.on('error', function (e) { 
+      console.error('[peer join error]', e.type, e);
+      if (e.type === 'peer-unavailable') {
+        self.onMessage({ t: 'error', text: 'Комната не найдена. Проверьте код или создайте новую.' });
+      } else if (e.type === 'network') {
+        self.onMessage({ t: 'error', text: 'Проблема с сетью. Проверьте подключение.' });
+      } else if (e.type === 'server-error' || e.type === 'socket-error' || e.type === 'socket-closed') {
+        self.onMessage({ t: 'error', text: 'Сервер PeerJS недоступен. Попробуйте позже.' });
+      } else {
+        self.onMessage({ t: 'error', text: 'Сеть: ' + (e.type || 'ошибка') }); 
+      }
+    });
+    self.peer.on('disconnected', function() {
+      console.log('[peer] disconnected, trying to reconnect...');
+      try {
+        if (self.peer && !self.peer.destroyed) {
+          self.peer.reconnect();
+        }
+      } catch(e) {}
+    });
     return true;
   });
 };
@@ -818,8 +881,17 @@ NetCtor.prototype.send = function (obj) {
   }
 };
 NetCtor.prototype.close = function () {
-  try { if (this.conn) this.conn.close(); } catch (e) {}
-  this.conn = null; this._destroyPeer();
+  try { 
+    if (this.conn) { 
+      try { this.conn.close(); } catch(e) {}
+      this.conn = null;
+    } 
+  } catch (e) {}
+  try {
+    this._destroyPeer();
+  } catch(e) {
+    this.peer = null;
+  }
 };
 function makeCode() {
   var A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789', s = '';
@@ -1385,4 +1457,79 @@ function handleAudioFile(file) {
   var type = file.type || 'audio/mpeg';
   var blobUrl = URL.createObjectURL(file);
   startAudio(blobUrl, {}, false);
-  G.audioState.wallStart = Date.now(); G.audioState.videoStart = 
+  G.audioState.wallStart = Date.now(); G.audioState.videoStart =
+
+/* ============================================================
+   ОБРАБОТКА СВЕРНУТИЯ/ВОССТАНОВЛЕНИЯ TELEGRAM MINI APP
+   ============================================================ */
+(function() {
+  var hiddenAt = 0;
+  var wasInRoom = false;
+  
+  function onVisibilityChange() {
+    if (document.visibilityState === 'hidden') {
+      hiddenAt = Date.now();
+      try {
+        if (typeof net !== 'undefined' && net && net.conn && net.conn.open) {
+          wasInRoom = !!(typeof roomCode !== 'undefined' && roomCode && typeof roomState !== 'undefined' && roomState && roomState.players && roomState.players.length > 0);
+        }
+      } catch(e) {}
+    } else if (document.visibilityState === 'visible') {
+      setTimeout(function() {
+        try {
+          if (typeof net !== 'undefined' && net) {
+            if (net.peer && !net.peer.destroyed) {
+              if (net.conn && !net.conn.open && wasInRoom && typeof roomCode !== 'undefined' && roomCode) {
+                if (!net.isHost) {
+                  console.log('[net] reconnecting after resume...');
+                  net.close();
+                  setTimeout(function() { net.join(roomCode); }, 500);
+                }
+              }
+            } else if (wasInRoom && typeof roomCode !== 'undefined' && roomCode) {
+              console.log('[net] recreating peer after resume...');
+              if (typeof net.close === 'function') net.close();
+              setTimeout(function() {
+                if (net.isHost) net.host(roomCode);
+                else net.join(roomCode);
+              }, 500);
+            }
+          }
+        } catch(e) {
+          console.error('[resume]', e);
+        }
+      }, 300);
+    }
+  }
+  
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', onVisibilityChange);
+  }
+  
+  if (typeof TG !== 'undefined' && TG) {
+    try {
+      if (typeof TG.onEvent === 'function') {
+        TG.onEvent('viewportChanged', function() {
+          if (document.visibilityState === 'visible') {
+            setTimeout(onVisibilityChange, 100);
+          }
+        });
+        TG.onEvent('activated', function() {
+          setTimeout(function() {
+            try {
+              if (typeof net !== 'undefined' && net && net.peer && net.peer.destroyed && wasInRoom && typeof roomCode !== 'undefined' && roomCode) {
+                if (typeof net.close === 'function') net.close();
+                setTimeout(function() {
+                  if (net.isHost) net.host(roomCode);
+                  else net.join(roomCode);
+                }, 500);
+              }
+            } catch(e) {}
+          }, 200);
+        });
+      }
+    } catch(e) {}
+  }
+})();
+}
+})();
