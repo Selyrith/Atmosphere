@@ -1,0 +1,14 @@
+{
+  "name": "atmosfera",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Атмосфера — онлайн RP-свидание (Telegram Mini App)",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=14"
+  },
+  "license": "MIT"
+}
