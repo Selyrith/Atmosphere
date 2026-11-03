@@ -1,7 +1,7 @@
 /* ============================================================ [FIXED]
    Атмосфера — RP-свидание. Один файл, без ES-модулей.
-   v1.1: STUN/TURN для PeerJS + устойчивость к сворачиванию
-   Telegram Mini App.
+   v1.2: восстановлены функции после handleAudioFile (bindings, gameplay,
+   init). Убрана вставка visibility-хендлера внутрь handleAudioFile.
    ============================================================ */
 (function () {
 'use strict';
@@ -37,9 +37,6 @@ function getStartParam() {
 
 /* ============================================================
    ПЕРЕХВАТ ОШИБОК
-   Фильтруем cross-origin "Script error." — это не наша ошибка,
-   а шум от CDN (PeerJS/Telegram SDK). Показываем баннер только
-   на настоящие падения.
    ============================================================ */
 function showFatal(label, detail) {
   var el = document.getElementById('boot-status');
@@ -59,7 +56,6 @@ function showFatal(label, detail) {
 }
 
 window.addEventListener('error', function (e) {
-  // Игнорируем cross-origin ошибки — они не имеют .filename и пишут "Script error."
   if (!e.filename && (!e.message || e.message === 'Script error.')) {
     console.warn('[cross-origin error ignored]', e);
     return;
@@ -72,7 +68,6 @@ window.addEventListener('error', function (e) {
 window.addEventListener('unhandledrejection', function (e) {
   var r = e.reason;
   var msg = r && (r.message || r.stack || String(r)) || '';
-  // Промисы тоже могут отклоняться cross-origin кодом
   if (msg === 'Script error.' || msg === '') {
     console.warn('[cross-origin rejection ignored]', e);
     return;
@@ -749,7 +744,6 @@ var ICE_CONFIG = {
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun.cloudflare.com:3478' },
-    // Бесплатный публичный TURN (openrelay.metered.ca)
     { urls: 'turn:openrelay.metered.ca:80',  username: 'openrelayproject', credential: 'openrelayproject' },
     { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
     { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
@@ -788,29 +782,19 @@ NetCtor.prototype.host = function (code) {
       return false;
     }
     self.peer.on('open', function () { self.onOpen(); });
-    self.peer.on('error', function (e) { 
+    self.peer.on('error', function (e) {
       console.error('[peer host error]', e.type, e);
-      if (e.type === 'unavailable-id') {
-        self.onMessage({ t: 'error', text: 'Код комнаты занят. Попробуйте другой.' });
-      } else if (e.type === 'network') {
-        self.onMessage({ t: 'error', text: 'Проблема с сетью. Проверьте подключение.' });
-      } else if (e.type === 'server-error' || e.type === 'socket-error' || e.type === 'socket-closed') {
-        self.onMessage({ t: 'error', text: 'Сервер PeerJS недоступен. Попробуйте позже.' });
-      } else {
-        self.onMessage({ t: 'error', text: 'Сеть: ' + (e.type || 'ошибка') }); 
-      }
+      if (e.type === 'unavailable-id') self.onMessage({ t: 'error', text: 'Код комнаты занят. Попробуйте другой.' });
+      else if (e.type === 'network') self.onMessage({ t: 'error', text: 'Проблема с сетью. Проверьте подключение.' });
+      else if (e.type === 'server-error' || e.type === 'socket-error' || e.type === 'socket-closed') self.onMessage({ t: 'error', text: 'Сервер PeerJS недоступен. Попробуйте позже.' });
+      else self.onMessage({ t: 'error', text: 'Сеть: ' + (e.type || 'ошибка') });
     });
     self.peer.on('connection', function (conn) {
       if (self.conn && self.conn.open) { try { conn.close(); } catch (e) {} return; }
       self.conn = conn; self._wire(conn);
     });
     self.peer.on('disconnected', function() {
-      console.log('[peer] disconnected, trying to reconnect...');
-      try {
-        if (self.peer && !self.peer.destroyed) {
-          self.peer.reconnect();
-        }
-      } catch(e) {}
+      try { if (self.peer && !self.peer.destroyed) self.peer.reconnect(); } catch(e) {}
     });
     return true;
   });
@@ -830,12 +814,10 @@ NetCtor.prototype.join = function (code) {
     self.peer.on('open', function () {
       var conn = self.peer.connect('atmos-' + code, { reliable: true, serialization: 'json' });
       self.conn = conn; self._wire(conn);
-      // Таймаут на подключение
       setTimeout(function() {
         if (!self.conn || !self.conn.open) {
           if (tried < 2) {
             tried++;
-            console.log('[net] retry connect attempt', tried);
             try {
               if (self.conn) self.conn.close();
               var conn2 = self.peer.connect('atmos-' + code, { reliable: true, serialization: 'json' });
@@ -845,25 +827,15 @@ NetCtor.prototype.join = function (code) {
         }
       }, 3000);
     });
-    self.peer.on('error', function (e) { 
+    self.peer.on('error', function (e) {
       console.error('[peer join error]', e.type, e);
-      if (e.type === 'peer-unavailable') {
-        self.onMessage({ t: 'error', text: 'Комната не найдена. Проверьте код или создайте новую.' });
-      } else if (e.type === 'network') {
-        self.onMessage({ t: 'error', text: 'Проблема с сетью. Проверьте подключение.' });
-      } else if (e.type === 'server-error' || e.type === 'socket-error' || e.type === 'socket-closed') {
-        self.onMessage({ t: 'error', text: 'Сервер PeerJS недоступен. Попробуйте позже.' });
-      } else {
-        self.onMessage({ t: 'error', text: 'Сеть: ' + (e.type || 'ошибка') }); 
-      }
+      if (e.type === 'peer-unavailable') self.onMessage({ t: 'error', text: 'Комната не найдена. Проверьте код или создайте новую.' });
+      else if (e.type === 'network') self.onMessage({ t: 'error', text: 'Проблема с сетью. Проверьте подключение.' });
+      else if (e.type === 'server-error' || e.type === 'socket-error' || e.type === 'socket-closed') self.onMessage({ t: 'error', text: 'Сервер PeerJS недоступен. Попробуйте позже.' });
+      else self.onMessage({ t: 'error', text: 'Сеть: ' + (e.type || 'ошибка') });
     });
     self.peer.on('disconnected', function() {
-      console.log('[peer] disconnected, trying to reconnect...');
-      try {
-        if (self.peer && !self.peer.destroyed) {
-          self.peer.reconnect();
-        }
-      } catch(e) {}
+      try { if (self.peer && !self.peer.destroyed) self.peer.reconnect(); } catch(e) {}
     });
     return true;
   });
@@ -881,17 +853,8 @@ NetCtor.prototype.send = function (obj) {
   }
 };
 NetCtor.prototype.close = function () {
-  try { 
-    if (this.conn) { 
-      try { this.conn.close(); } catch(e) {}
-      this.conn = null;
-    } 
-  } catch (e) {}
-  try {
-    this._destroyPeer();
-  } catch(e) {
-    this.peer = null;
-  }
+  try { if (this.conn) { try { this.conn.close(); } catch(e) {} this.conn = null; } } catch (e) {}
+  try { this._destroyPeer(); } catch(e) { this.peer = null; }
 };
 function makeCode() {
   var A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789', s = '';
@@ -1215,6 +1178,7 @@ var G = {
   myResult: null, peerResult: null,
   minigamesEnabled: true,
   locationState: {},
+  creatorIntent: null, creatorJoinCode: null,
   video: { active: false, kind: null, src: null, el: null, wallStart: 0, videoStart: 0, playing: false, lastStateId: null, pendingFileSrc: null, pendingState: null },
   audioState: { active: false, wallStart: 0, videoStart: 0, playing: false },
   audioEl: null
@@ -1244,6 +1208,11 @@ function toast(msg) {
   el.textContent = msg; el.classList.add('show');
   clearTimeout(toast._t);
   toast._t = setTimeout(function () { el.classList.remove('show'); }, 2400);
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
 }
 
 /* ---- Видео ---- */
@@ -1418,9 +1387,13 @@ setInterval(function () {
   }
 }, 4000);
 
+/* ============================================================
+   Передача файлов
+   ============================================================ */
 var FILE_CHUNK = 16384;
 var FILE_MAX = 50 * 1024 * 1024;
 var incoming = null;
+
 function transferFile(file, type, onDone) {
   var total = Math.ceil(file.size / FILE_CHUNK);
   net.send({ t: 'file-start', name: file.name, type: type, size: file.size, total: total });
@@ -1457,79 +1430,1047 @@ function handleAudioFile(file) {
   var type = file.type || 'audio/mpeg';
   var blobUrl = URL.createObjectURL(file);
   startAudio(blobUrl, {}, false);
-  G.audioState.wallStart = Date.now(); G.audioState.videoStart =
+  G.audioState.wallStart = Date.now();
+  G.audioState.videoStart = 0;
+  if (G.mode === 'host' && net.conn && net.conn.open) {
+    transferFile(file, type, function () {
+      net.send({ t: 'audio-state', wallStart: G.audioState.wallStart, videoStart: G.audioState.videoStart, playing: true });
+    });
+  }
+}
 
 /* ============================================================
-   ОБРАБОТКА СВЕРНУТИЯ/ВОССТАНОВЛЕНИЯ TELEGRAM MINI APP
+   Приём файлов
    ============================================================ */
-(function() {
-  var hiddenAt = 0;
+function handleFileStart(msg) {
+  incoming = {
+    name: msg.name || 'file',
+    type: msg.type || 'application/octet-stream',
+    size: msg.size || 0,
+    total: msg.total || 0,
+    chunks: [],
+    received: 0
+  };
+  toast('Принимаю файл…');
+}
+function handleFileChunk(msg) {
+  if (!incoming) return;
+  incoming.chunks[msg.idx] = new Uint8Array(msg.data);
+  incoming.received++;
+  if (incoming.total && incoming.received >= incoming.total) handleFileEnd();
+}
+function handleFileEnd() {
+  if (!incoming) return;
+  var blob = new Blob(incoming.chunks, { type: incoming.type });
+  var url = URL.createObjectURL(blob);
+  var kind = incoming.type.split('/')[0];
+  if (kind === 'video') {
+    G.video.pendingFileSrc = url;
+    if (G.video.pendingState) {
+      var ps = G.video.pendingState;
+      G.video.pendingState = null;
+      startVideo('file', url, { wallStart: ps.wallStart, videoStart: ps.videoStart }, false);
+    }
+  } else if (kind === 'audio') {
+    startAudio(url, {}, false);
+    G.audioState.wallStart = Date.now();
+    G.audioState.videoStart = 0;
+  }
+  incoming = null;
+  toast('Файл получен');
+}
+
+/* ============================================================
+   Интерактивная панель
+   ============================================================ */
+function updateInteractiveBar() {
+  var v = $('btn-show-video');
+  var l = $('btn-show-link');
+  var t = $('btn-show-track');
+  var s = $('btn-stop-media');
+  var isHost = G.mode === 'host';
+  var loc = G.location;
+  if (v) v.style.display = (isHost && loc === 'cinema') ? '' : 'none';
+  if (l) l.style.display = (isHost && loc === 'cinema') ? '' : 'none';
+  if (t) t.style.display = (isHost && loc === 'club') ? '' : 'none';
+  if (s) s.style.display = (isHost && (G.video.active || G.audioState.active)) ? '' : 'none';
+  var ms = $('media-status');
+  if (ms) {
+    if (G.video.active) ms.textContent = '🎬 Включено видео';
+    else if (G.audioState.active) ms.textContent = '🎵 Играет музыка';
+    else ms.textContent = '';
+  }
+}
+
+/* ============================================================
+   История / лог
+   ============================================================ */
+function pushHistory(who, text) {
+  G.history.push({ who: who, text: text, t: Date.now() });
+  renderLog();
+}
+function renderLog() {
+  var log = $('log');
+  if (!log) return;
+  log.innerHTML = '';
+  G.history.forEach(function (m) {
+    var div = document.createElement('div');
+    if (m.who === 'narr') {
+      div.className = 'msg narr';
+      div.textContent = m.text;
+    } else if (m.who === 'sys') {
+      div.className = 'msg sys';
+      div.textContent = m.text;
+    } else if (m.who === 'fail') {
+      div.className = 'msg fail';
+      div.textContent = m.text;
+    } else {
+      div.className = 'msg act';
+      var name;
+      if (m.who === G.myRole) name = G.profile.name;
+      else name = (G.peerProfile && G.peerProfile.name) || (m.who === 'a' ? 'A' : 'B');
+      div.innerHTML = '<b>' + escapeHtml(name) + ':</b> ' + escapeHtml(m.text);
+    }
+    log.appendChild(div);
+  });
+  log.scrollTop = log.scrollHeight;
+}
+function updateTurnLabel() {
+  var el = $('turn-label');
+  if (!el) return;
+  var name;
+  if (G.turn === G.myRole) name = 'Ты';
+  else name = (G.peerProfile && G.peerProfile.name) || (G.turn === 'a' ? 'A' : 'B');
+  el.textContent = 'Ход: ' + name;
+}
+function updateSendState() {
+  var btn = $('btn-send');
+  var inp = $('inp-action');
+  if (!btn || !inp) return;
+  var isMyTurn = G.turn === G.myRole;
+  var canAct = isMyTurn && !G.thinking && !G.minigameCtx;
+  btn.disabled = !canAct || !inp.value.trim();
+  inp.disabled = !canAct;
+}
+function updateLocName() {
+  var el = $('loc-name');
+  if (el) el.textContent = getLocation(G.location).name;
+}
+
+/* ============================================================
+   Действия
+   ============================================================ */
+function handleAction(who, text, opts) {
+  opts = opts || {};
+  pushHistory(who, text);
+  G.talking[who] = 2;
+  if (G.turn === who) {
+    G.turn = (G.mode === 'solo') ? G.myRole : (who === 'a' ? 'b' : 'a');
+  }
+  updateSendState();
+  updateTurnLabel();
+
+  if (!opts.fromPeer && net.conn && net.conn.open) {
+    net.send({ t: 'action', who: who, text: text });
+  }
+
+  requestNarration();
+}
+function requestNarration() {
+  if (G.thinking) return;
+  var lastA = null, lastB = null;
+  for (var i = G.history.length - 1; i >= 0; i--) {
+    var m = G.history[i];
+    if (m.who === 'a' && lastA === null) lastA = m.text;
+    if (m.who === 'b' && lastB === null) lastB = m.text;
+    if (lastA !== null && lastB !== null) break;
+  }
+  // в мультиплеере ждём оба действия; в соло — только своё
+  if (G.mode !== 'solo' && (lastA === null || lastB === null)) return;
+
+  G.thinking = true;
+  updateSendState();
+  var ps = $('play-status');
+  if (ps) ps.textContent = 'Мир отвечает…';
+
+  var ctx = {
+    location: getLocation(G.location).name,
+    scenario: 'свидание',
+    mood: G.mood,
+    chemistry: G.chemistry,
+    profiles: {
+      a: G.myRole === 'a' ? G.profile : (G.peerProfile || defaultProfile('A')),
+      b: G.myRole === 'b' ? G.profile : (G.peerProfile || defaultProfile('B'))
+    },
+    history: G.history.slice()
+  };
+
+  narrate(ctx).then(function (res) {
+    G.thinking = false;
+    updateSendState();
+    if (ps) ps.textContent = '';
+    if (!res) return;
+    G.mood = Math.max(0, Math.min(100, G.mood + (res.moodDelta || 0)));
+    G.chemistry = Math.max(0, Math.min(100, G.chemistry + (res.chemDelta || 0)));
+    pushHistory('narr', res.narration);
+    if (res.location && res.location !== G.location) {
+      G.pendingLocation = res.location;
+      G.transition = 1;
+      setTimeout(function () {
+        G.location = res.location;
+        G.pendingLocation = null;
+        G.locationState[G.location] = INTERACTIVES[G.location] ? INTERACTIVES[G.location].init() : {};
+        updateLocName();
+        updateInteractiveBar();
+        pushHistory('sys', 'Локация сменилась: ' + getLocation(res.location).name);
+      }, 800);
+    }
+    if (G.mode === 'host' && net.conn && net.conn.open) {
+      net.send({ t: 'narr', narration: res.narration, moodDelta: res.moodDelta, chemDelta: res.chemDelta, location: res.location });
+    }
+    if (G.chemistry >= 100 || G.mood <= 0) {
+      doEpilogue();
+    }
+  });
+}
+function sendAction() {
+  var inp = $('inp-action');
+  if (!inp) return;
+  var text = inp.value.trim();
+  if (!text) return;
+  if (G.turn !== G.myRole) return;
+  if (G.thinking) return;
+  if (G.minigameCtx) return;
+  inp.value = '';
+  updateSendState();
+
+  if (G.minigamesEnabled) {
+    var mgId = detectMinigame(text);
+    startMinigame(mgId, text, true);
+    if (G.mode !== 'solo' && net.conn && net.conn.open) {
+      net.send({ t: 'minigame-pending', id: mgId, actionText: text });
+    }
+  } else {
+    handleAction(G.myRole, text);
+  }
+}
+
+/* ============================================================
+   Мини-игры: запуск / завершение
+   ============================================================ */
+function startMinigame(id, actionText, isInitiator) {
+  G.minigameCtx = { id: id, actionText: actionText, initiator: !!isInitiator };
+  G.myResult = null;
+  G.peerResult = null;
+  G.minigame = new MiniGame(id, actionText, {});
+  var title = $('minigame-title');
+  var hint = $('minigame-hint');
+  var res = $('minigame-result');
+  if (title) title.textContent = G.minigame.def.title || 'Мини-игра';
+  if (hint) hint.textContent = G.minigame.def.hint || '';
+  if (res) { res.className = 'mg-result'; res.textContent = ''; }
+  G.minigame.onFinish = function (result) { finishMinigame(result); };
+  go('minigame');
+}
+function finishMinigame(result) {
+  if (!G.minigameCtx || G.myResult) return;
+  G.myResult = result;
+  var res = $('minigame-result');
+  if (res) {
+    res.className = 'mg-result show ' + (result === 'win' ? 'win' : 'lose');
+    res.textContent = result === 'win' ? 'Успех!' : 'Провал';
+  }
+  if (G.mode === 'solo') {
+    G.peerResult = 'win';
+    setTimeout(resolveMinigame, 900);
+    return;
+  }
+  if (net.conn && net.conn.open) net.send({ t: 'minigame', result: result });
+  if (G.peerResult) {
+    setTimeout(resolveMinigame, 500);
+  } else {
+    var status = $('minigame-hint');
+    if (status) status.textContent = 'Ждём партнёра…';
+    setTimeout(function () { if (G.minigameCtx) { G.peerResult = G.peerResult || 'lose'; resolveMinigame(); } }, 20000);
+  }
+}
+function maybeResolveFromPeer() {
+  if (!G.minigameCtx) return;
+  if (!G.myResult) return;
+  setTimeout(resolveMinigame, 500);
+}
+function resolveMinigame() {
+  if (!G.minigameCtx) return;
+  var ctx = G.minigameCtx;
+  G.minigameCtx = null;
+  G.minigame = null;
+  var success = G.myResult === 'win' && G.peerResult === 'win';
+  var myResultSaved = G.myResult;
+  G.myResult = null;
+  G.peerResult = null;
+  go('play');
+  if (success) {
+    if (ctx.initiator) handleAction(G.myRole, ctx.actionText);
+  } else {
+    if (ctx.initiator) {
+      pushHistory('fail', 'Мини-игра провалена — действие не удалось. Попробуй ещё раз.');
+      if (net.conn && net.conn.open) net.send({ t: 'fail', text: 'Партнёр провалил мини-игру' });
+    } else if (myResultSaved === 'win') {
+      pushHistory('fail', 'Партнёр провалил мини-игру');
+    }
+    updateSendState();
+    updateTurnLabel();
+  }
+}
+
+/* ============================================================
+   Рендер сцены
+   ============================================================ */
+var sceneCtx = null;
+function setupSceneCanvas() {
+  var c = $('cv-scene');
+  if (!c) return;
+  sceneCtx = c.getContext('2d');
+  sceneCtx.imageSmoothingEnabled = false;
+}
+function renderScene(dt) {
+  if (!sceneCtx) return;
+  var ctx = sceneCtx;
+  ctx.clearRect(0, 0, 160, 100);
+
+  var loc = getLocation(G.location);
+  ctx.save(); loc.draw(ctx, G.t); ctx.restore();
+
+  var inter = INTERACTIVES[G.location];
+  if (inter) {
+    if (!G.locationState[G.location]) G.locationState[G.location] = inter.init();
+    ctx.save(); inter.render(ctx, G.locationState[G.location]); ctx.restore();
+  }
+
+  var aProf = G.myRole === 'a' ? G.profile : (G.peerProfile || defaultProfile('A'));
+  var bProf = G.myRole === 'b' ? G.profile : (G.peerProfile || defaultProfile('B'));
+  drawAvatarScaled(ctx, 26, 54, 1.7, aProf, { t: G.t, talking: G.talking.a > 0 });
+  drawAvatarScaled(ctx, 100, 54, 1.7, bProf, { t: G.t, talking: G.talking.b > 0 });
+
+  if (G.transition > 0) {
+    G.transition = Math.max(0, G.transition - dt * 1.2);
+    ctx.fillStyle = 'rgba(0,0,0,' + (G.transition * 0.6) + ')';
+    ctx.fillRect(0, 0, 160, 100);
+  }
+}
+function scenePointer(evt) {
+  if (!sceneCtx) return;
+  var c = $('cv-scene');
+  var rect = c.getBoundingClientRect();
+  var x = ((evt.clientX - rect.left) / rect.width) * 160;
+  var y = ((evt.clientY - rect.top) / rect.height) * 100;
+  var inter = INTERACTIVES[G.location];
+  if (!inter || !inter.pointer) return;
+  if (!G.locationState[G.location]) G.locationState[G.location] = inter.init();
+  var res = inter.pointer(x, y, 'down', G.locationState[G.location]);
+  if (res && net.conn && net.conn.open) {
+    net.send({ t: 'interact', loc: G.location, action: res.action, data: res.data });
+  }
+}
+
+/* ============================================================
+   Сеть: сообщения
+   ============================================================ */
+function setLobbyStatus(text) {
+  var el = $('lobby-status');
+  if (el) el.textContent = text;
+}
+function setupNetHandlers() {
+  net.onOpen = function () {
+    if (G.mode === 'host') {
+      net.send({ t: 'hello-host', profile: G.profile });
+    } else {
+      net.send({ t: 'hello-guest', profile: G.profile });
+    }
+    setLobbyStatus('Соединение установлено');
+    var startBtn = $('btn-start');
+    if (startBtn && G.mode === 'host') startBtn.disabled = false;
+  };
+  net.onClose = function () {
+    setLobbyStatus('Партнёр отключился');
+    if (G.state === 'play') pushHistory('sys', 'Партнёр отключился.');
+  };
+  net.onMessage = function (msg) {
+    if (!msg || !msg.t) return;
+    switch (msg.t) {
+      case 'hello-host':
+        G.peerProfile = msg.profile;
+        renderLobby();
+        setLobbyStatus('Соединение установлено');
+        var sbtn = $('btn-start');
+        if (sbtn) sbtn.disabled = false;
+        if (G.mode === 'host') net.send({ t: 'welcome', profile: G.profile });
+        break;
+      case 'hello-guest':
+        G.peerProfile = msg.profile;
+        renderLobby();
+        setLobbyStatus('В лобби');
+        break;
+      case 'welcome':
+        G.peerProfile = msg.profile;
+        renderLobby();
+        break;
+      case 'error':
+        setLobbyStatus(msg.text);
+        toast(msg.text);
+        break;
+      case 'vote-start':
+        showVote(msg.choices);
+        break;
+      case 'start':
+        G.location = msg.location;
+        G.turn = 'a';
+        G.mood = 50;
+        G.chemistry = 50;
+        G.history = [];
+        G.locationState[G.location] = INTERACTIVES[G.location] ? INTERACTIVES[G.location].init() : {};
+        go('play');
+        updateLocName();
+        updateInteractiveBar();
+        updateTurnLabel();
+        updateSendState();
+        renderLog();
+        pushHistory('sys', 'Начало. Локация: ' + getLocation(G.location).name);
+        break;
+      case 'action':
+        handleAction(msg.who, msg.text, { fromPeer: true });
+        break;
+      case 'narr':
+        G.mood = Math.max(0, Math.min(100, G.mood + (msg.moodDelta || 0)));
+        G.chemistry = Math.max(0, Math.min(100, G.chemistry + (msg.chemDelta || 0)));
+        pushHistory('narr', msg.narration);
+        if (msg.location && msg.location !== G.location) {
+          G.transition = 1;
+          setTimeout(function () {
+            G.location = msg.location;
+            G.locationState[G.location] = INTERACTIVES[G.location] ? INTERACTIVES[G.location].init() : {};
+            updateLocName();
+            updateInteractiveBar();
+          }, 800);
+        }
+        break;
+      case 'minigame-pending':
+        if (!G.minigameCtx) startMinigame(msg.id, msg.actionText, false);
+        break;
+      case 'minigame':
+        G.peerResult = msg.result;
+        maybeResolveFromPeer();
+        break;
+      case 'fail':
+        pushHistory('fail', msg.text || 'Мини-игра провалена');
+        break;
+      case 'interact':
+        if (INTERACTIVES[msg.loc] && INTERACTIVES[msg.loc].apply) {
+          if (!G.locationState[msg.loc]) G.locationState[msg.loc] = INTERACTIVES[msg.loc].init();
+          INTERACTIVES[msg.loc].apply(msg.action, msg.data, G.locationState[msg.loc]);
+        }
+        break;
+      case 'file-start': handleFileStart(msg); break;
+      case 'file-chunk': handleFileChunk(msg); break;
+      case 'file-end': handleFileEnd(); break;
+      case 'video-state': applyVideoState(msg); break;
+      case 'video-stop': stopVideo(false); break;
+      case 'video-pause':
+        if (G.video.el && G.video.kind !== 'youtube') { try { G.video.el.pause(); G.video.el.currentTime = msg.time || 0; } catch(e){} }
+        break;
+      case 'audio-state': applyAudioState(msg); break;
+      case 'audio-stop': stopAudio(false); break;
+      case 'vote':
+        G.votes[msg.role] = msg.location;
+        checkVotes();
+        break;
+      case 'over':
+        showOver(msg);
+        break;
+    }
+  };
+}
+
+/* ============================================================
+   Комната
+   ============================================================ */
+function hostRoom() {
+  var code = makeCode();
+  G.mode = 'host';
+  G.myRole = 'a';
+  net.host(code).then(function (ok) {
+    if (!ok) return;
+    var codeEl = $('lobby-code');
+    if (codeEl) codeEl.textContent = code;
+    renderLobby();
+    go('lobby');
+  });
+}
+function joinRoom(code) {
+  G.mode = 'guest';
+  G.myRole = 'b';
+  net.join(code).then(function (ok) {
+    if (!ok) return;
+    var codeEl = $('lobby-code');
+    if (codeEl) codeEl.textContent = code;
+    renderLobby();
+    go('lobby');
+  });
+}
+function soloMode() {
+  G.mode = 'solo';
+  G.myRole = 'a';
+  G.peerProfile = randomProfile('Партнёр');
+  var locs = LOCATIONS.filter(function (l) { return l.id !== 'cinema' && l.id !== 'club'; });
+  G.location = locs[Math.floor(Math.random() * locs.length)].id;
+  G.turn = 'a';
+  G.mood = 50;
+  G.chemistry = 50;
+  G.history = [];
+  G.locationState[G.location] = INTERACTIVES[G.location] ? INTERACTIVES[G.location].init() : {};
+  go('play');
+  updateLocName();
+  updateInteractiveBar();
+  updateTurnLabel();
+  updateSendState();
+  renderLog();
+  pushHistory('sys', 'Соло-режим. Локация: ' + getLocation(G.location).name);
+}
+
+/* ============================================================
+   Лобби
+   ============================================================ */
+function renderLobby() {
+  var roster = $('lobby-roster');
+  if (!roster) return;
+  roster.innerHTML = '';
+  var my = document.createElement('div');
+  my.className = 'slot filled';
+  var cv1 = document.createElement('canvas');
+  cv1.width = 48; cv1.height = 72;
+  var c1 = cv1.getContext('2d'); c1.imageSmoothingEnabled = false;
+  drawAvatarScaled(c1, 4, 4, 2, G.profile, { t: 0 });
+  my.appendChild(cv1);
+  var nm1 = document.createElement('div');
+  nm1.textContent = G.profile.name + ' (ты)';
+  my.appendChild(nm1);
+  roster.appendChild(my);
+
+  var peer = document.createElement('div');
+  if (G.peerProfile) {
+    peer.className = 'slot filled';
+    var cv2 = document.createElement('canvas');
+    cv2.width = 48; cv2.height = 72;
+    var c2 = cv2.getContext('2d'); c2.imageSmoothingEnabled = false;
+    drawAvatarScaled(c2, 4, 4, 2, G.peerProfile, { t: 0 });
+    peer.appendChild(cv2);
+    var nm2 = document.createElement('div');
+    nm2.textContent = G.peerProfile.name;
+    peer.appendChild(nm2);
+  } else {
+    peer.className = 'slot';
+    peer.textContent = 'Ожидание…';
+  }
+  roster.appendChild(peer);
+}
+function shareCode() {
+  var codeEl = $('lobby-code');
+  var code = codeEl ? codeEl.textContent : '';
+  if (!code || code === '····') return;
+  var link = '';
+  if (BOT_USERNAME) {
+    link = 'https://t.me/' + BOT_USERNAME + (BOT_APPNAME ? '/' + BOT_APPNAME : '') + '?startapp=' + code;
+  }
+  var text = link || ('Код комнаты: ' + code);
+  if (navigator.share) {
+    navigator.share({ text: text }).catch(function () { copyToClipboard(text); });
+  } else {
+    copyToClipboard(text);
+  }
+}
+function copyToClipboard(text) {
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(text).then(function () { toast('Скопировано'); }, function () { toast(text); });
+  } else {
+    toast(text);
+  }
+}
+
+/* ============================================================
+   Голосование
+   ============================================================ */
+function showVote(choices) {
+  var choicesEl = $('vote-choices');
+  if (!choicesEl) return;
+  choicesEl.innerHTML = '';
+  var ids;
+  if (choices && choices.length) {
+    ids = choices.slice();
+  } else {
+    var pool = LOCATIONS.filter(function (l) { return l.id !== 'cinema' && l.id !== 'club'; });
+    ids = pool.slice().sort(function () { return Math.random() - 0.5; }).slice(0, 4).map(function (l) { return l.id; });
+  }
+  G.voteChoices = ids;
+  G.votes = { a: null, b: null };
+  ids.forEach(function (id) {
+    var loc = getLocation(id);
+    var btn = document.createElement('button');
+    btn.className = 'vote-card';
+    btn.dataset.loc = id;
+    var cv = document.createElement('canvas');
+    cv.width = 160; cv.height = 100;
+    var cc = cv.getContext('2d'); cc.imageSmoothingEnabled = false;
+    loc.draw(cc, 0);
+    btn.appendChild(cv);
+    var lbl = document.createElement('div');
+    lbl.className = 'vote-label';
+    lbl.textContent = loc.name;
+    btn.appendChild(lbl);
+    btn.onclick = function () { castVote(id); };
+    choicesEl.appendChild(btn);
+  });
+  var status = $('vote-status');
+  if (status) status.textContent = 'Выбери локацию';
+  go('vote');
+}
+function castVote(id) {
+  G.votes[G.myRole] = id;
+  document.querySelectorAll('#vote-choices .vote-card').forEach(function (card) {
+    card.classList.toggle('voted', card.dataset.loc === id);
+  });
+  if (net.conn && net.conn.open) {
+    net.send({ t: 'vote', role: G.myRole, location: id });
+  }
+  var status = $('vote-status');
+  if (status) status.textContent = 'Ждём партнёра…';
+  checkVotes();
+}
+function checkVotes() {
+  if (G.mode === 'solo') {
+    if (G.votes.a) {
+      G.location = G.votes.a;
+      startGame();
+    }
+    return;
+  }
+  if (G.mode === 'host') {
+    if (G.votes.a && G.votes.b) {
+      var v = Math.random() < 0.5 ? G.votes.a : G.votes.b;
+      G.location = v;
+      startGame();
+    }
+  }
+}
+function startGame() {
+  G.turn = 'a';
+  G.mood = 50;
+  G.chemistry = 50;
+  G.history = [];
+  G.locationState[G.location] = INTERACTIVES[G.location] ? INTERACTIVES[G.location].init() : {};
+  if (net.conn && net.conn.open) {
+    net.send({ t: 'start', location: G.location });
+  }
+  go('play');
+  updateLocName();
+  updateInteractiveBar();
+  updateTurnLabel();
+  updateSendState();
+  renderLog();
+  pushHistory('sys', 'Начало. Локация: ' + getLocation(G.location).name);
+}
+
+/* ============================================================
+   Финал
+   ============================================================ */
+function doEpilogue() {
+  var ctx = {
+    location: getLocation(G.location).name,
+    mood: G.mood,
+    chemistry: G.chemistry,
+    profiles: {
+      a: G.myRole === 'a' ? G.profile : (G.peerProfile || defaultProfile('A')),
+      b: G.myRole === 'b' ? G.profile : (G.peerProfile || defaultProfile('B'))
+    }
+  };
+  makeEpilogue(ctx).then(function (text) {
+    showOver({ epilogue: text, mood: G.mood, chemistry: G.chemistry });
+    if (G.mode === 'host' && net.conn && net.conn.open) {
+      net.send({ t: 'over', epilogue: text, mood: G.mood, chemistry: G.chemistry });
+    }
+  });
+}
+function showOver(data) {
+  var title = $('over-title');
+  var epi = $('over-epilogue');
+  var stats = $('over-stats');
+  if (title) title.textContent = 'Конец';
+  if (epi) epi.textContent = data.epilogue || '';
+  if (stats) {
+    stats.innerHTML =
+      '<div class="stat"><div class="num">' + (data.chemistry || 0) + '</div><div class="cap">Химия</div></div>' +
+      '<div class="stat"><div class="num">' + (data.mood || 0) + '</div><div class="cap">Настроение</div></div>';
+  }
+  go('over');
+}
+
+/* ============================================================
+   Создатель
+   ============================================================ */
+function renderCreator() {
+  var ctrl = $('creator-controls');
+  if (!ctrl) return;
+  ctrl.innerHTML = '';
+  var fields = [
+    { key: 'skin', name: 'Кожа', arr: SKIN },
+    { key: 'hairColor', name: 'Волосы', arr: HAIR },
+    { key: 'hair', name: 'Причёска', arr: HAIR_STYLES, names: HAIR_NAMES },
+    { key: 'eyes', name: 'Глаза', arr: EYE_STYLES, names: EYE_NAMES },
+    { key: 'eyeColor', name: 'Цвет глаз', arr: EYE_COLORS },
+    { key: 'shirt', name: 'Одежда', arr: SHIRT_STYLES, names: SHIRT_NAMES },
+    { key: 'shirtColor', name: 'Цвет', arr: SHIRT_COLORS },
+    { key: 'acc', name: 'Аксессуар', arr: ACCESSORIES, names: ACC_NAMES }
+  ];
+  fields.forEach(function (f) {
+    var row = document.createElement('div');
+    row.className = 'row';
+    var name = document.createElement('div');
+    name.className = 'name';
+    name.textContent = f.name;
+    var left = document.createElement('button');
+    left.className = 'arrow';
+    left.textContent = '‹';
+    var val = document.createElement('div');
+    val.className = 'val';
+    function updateVal() {
+      var v = G.profile[f.key] | 0;
+      if (f.names) {
+        var raw = f.arr[v];
+        val.textContent = f.names[raw] || raw;
+      } else {
+        val.textContent = (v + 1) + ' / ' + f.arr.length;
+      }
+    }
+    left.onclick = function () {
+      G.profile[f.key] = (G.profile[f.key] - 1 + f.arr.length) % f.arr.length;
+      updateVal();
+    };
+    var right = document.createElement('button');
+    right.className = 'arrow';
+    right.textContent = '›';
+    right.onclick = function () {
+      G.profile[f.key] = (G.profile[f.key] + 1) % f.arr.length;
+      updateVal();
+    };
+    updateVal();
+    row.appendChild(name);
+    row.appendChild(left);
+    row.appendChild(val);
+    row.appendChild(right);
+    ctrl.appendChild(row);
+  });
+}
+function renderCreatorPreview() {
+  var cv = $('cv-preview');
+  if (!cv) return;
+  var ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, 96, 144);
+  ctx.imageSmoothingEnabled = false;
+  drawAvatarScaled(ctx, 0, 0, 6, G.profile, { t: G.t });
+}
+
+/* ============================================================
+   Настройки AI
+   ============================================================ */
+function loadSettings() {
+  try {
+    var key = localStorage.getItem('atm_apikey');
+    var model = localStorage.getItem('atm_model');
+    if (key) G.ai.apiKey = key;
+    if (model) G.ai.model = model;
+  } catch (e) {}
+}
+function saveSettings() {
+  var keyEl = $('inp-apikey');
+  var modelEl = $('inp-model');
+  if (keyEl) G.ai.apiKey = keyEl.value.trim();
+  if (modelEl) G.ai.model = modelEl.value.trim() || 'openrouter/free';
+  try {
+    localStorage.setItem('atm_apikey', G.ai.apiKey);
+    localStorage.setItem('atm_model', G.ai.model);
+  } catch (e) {}
+  var status = $('settings-status');
+  if (status) status.textContent = 'Сохранено ✓';
+  toast('Настройки сохранены');
+}
+function testAI() {
+  var status = $('settings-status');
+  if (status) status.textContent = 'Проверка…';
+  if (!G.ai.apiKey) {
+    if (status) status.textContent = 'Нет API-ключа';
+    return;
+  }
+  fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + G.ai.apiKey,
+      'HTTP-Referer': window.location.origin || 'http://localhost',
+      'X-Title': 'Atmosfera'
+    },
+    body: JSON.stringify({ model: G.ai.model || 'openrouter/free', messages: [{ role: 'user', content: 'Say "ok"' }], max_tokens: 10 })
+  }).then(function (r) {
+    if (r.ok) { if (status) status.textContent = 'Соединение OK ✓'; }
+    else { if (status) status.textContent = 'Ошибка: HTTP ' + r.status; }
+  }).catch(function (e) {
+    if (status) status.textContent = 'Ошибка сети: ' + (e.message || '');
+  });
+}
+
+/* ============================================================
+   Медиа-кнопки
+   ============================================================ */
+function promptVideoLink() {
+  var url = window.prompt('YouTube или прямая ссылка на видео:', '');
+  if (!url) return;
+  var kind = parseYouTubeId(url) ? 'youtube' : 'file';
+  startVideo(kind, url, {}, true);
+}
+function pickVideo() { var p = $('video-picker'); if (p) p.click(); }
+function pickAudio() { var p = $('audio-picker'); if (p) p.click(); }
+function stopAllMedia() { stopVideo(true); stopAudio(true); }
+
+/* ============================================================
+   Биндинги
+   ============================================================ */
+function bindAll() {
+  // menu
+  safeOn('btn-host', 'onclick', function () { G.creatorIntent = 'host'; G.creatorJoinCode = null; renderCreator(); go('creator'); });
+  safeOn('btn-join', 'onclick', function () {
+    var code = getStartParam();
+    if (code) { var el = $('inp-code'); if (el) el.value = code.toUpperCase(); }
+    go('join');
+  });
+  safeOn('btn-solo', 'onclick', function () { G.creatorIntent = 'solo'; renderCreator(); go('creator'); });
+  safeOn('btn-ai-settings', 'onclick', function () {
+    var k = $('inp-apikey'); if (k) k.value = G.ai.apiKey || '';
+    var m = $('inp-model'); if (m) m.value = G.ai.model || 'openrouter/free';
+    go('settings');
+  });
+  var chk = $('chk-minigames');
+  if (chk) {
+    chk.checked = G.minigamesEnabled;
+    chk.onchange = function () { G.minigamesEnabled = chk.checked; };
+  }
+
+  // join
+  safeOn('btn-join-go', 'onclick', function () {
+    var inp = $('inp-code');
+    var code = inp ? inp.value.trim().toUpperCase() : '';
+    if (code.length !== 4) {
+      var status = $('join-status');
+      if (status) status.textContent = 'Введите 4-символьный код';
+      return;
+    }
+    G.creatorIntent = 'join';
+    G.creatorJoinCode = code;
+    renderCreator();
+    go('creator');
+  });
+  var codeInp = $('inp-code');
+  if (codeInp) {
+    codeInp.addEventListener('input', function () {
+      codeInp.value = codeInp.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
+    });
+  }
+
+  // back
+  document.querySelectorAll('[data-back]').forEach(function (btn) {
+    btn.onclick = function () {
+      var target = btn.dataset.back;
+      net.close();
+      if (target === 'menu') {
+        G.mode = 'idle';
+        G.history = [];
+        stopVideo(false); stopAudio(false);
+      }
+      go(target);
+    };
+  });
+
+  // creator
+  safeOn('btn-creator-done', 'onclick', function () {
+    var intent = G.creatorIntent;
+    var joinCode = G.creatorJoinCode;
+    G.creatorIntent = null;
+    G.creatorJoinCode = null;
+    if (intent === 'host') hostRoom();
+    else if (intent === 'join') joinRoom(joinCode);
+    else if (intent === 'solo') soloMode();
+    else go('menu');
+  });
+  safeOn('btn-creator-rand', 'onclick', function () {
+    G.profile = randomProfile(G.profile.name);
+    renderCreator();
+  });
+
+  // lobby
+  safeOn('btn-start', 'onclick', function () {
+    var pool = LOCATIONS.filter(function (l) { return l.id !== 'cinema' && l.id !== 'club'; });
+    var ids = pool.slice().sort(function () { return Math.random() - 0.5; }).slice(0, 4).map(function (l) { return l.id; });
+    showVote(ids);
+    if (net.conn && net.conn.open) {
+      net.send({ t: 'vote-start', choices: ids });
+    }
+  });
+  safeOn('btn-share-room', 'onclick', shareCode);
+
+  // play
+  safeOn('btn-send', 'onclick', sendAction);
+  var inpAction = $('inp-action');
+  if (inpAction) {
+    inpAction.addEventListener('input', updateSendState);
+    inpAction.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendAction(); }
+    });
+  }
+  safeOn('btn-show-video', 'onclick', pickVideo);
+  safeOn('btn-show-link', 'onclick', promptVideoLink);
+  safeOn('btn-show-track', 'onclick', pickAudio);
+  safeOn('btn-stop-media', 'onclick', stopAllMedia);
+
+  var vp = $('video-picker');
+  if (vp) vp.onchange = function (e) { if (e.target.files[0]) handleVideoFile(e.target.files[0]); e.target.value = ''; };
+  var ap = $('audio-picker');
+  if (ap) ap.onchange = function (e) { if (e.target.files[0]) handleAudioFile(e.target.files[0]); e.target.value = ''; };
+
+  var scene = $('cv-scene');
+  if (scene) scene.addEventListener('pointerdown', scenePointer);
+
+  // minigame canvas
+  var mg = $('cv-minigame');
+  if (mg) {
+    mg.addEventListener('pointerdown', function (evt) {
+      if (!G.minigame) return;
+      var rect = mg.getBoundingClientRect();
+      var x = ((evt.clientX - rect.left) / rect.width) * 160;
+      var y = ((evt.clientY - rect.top) / rect.height) * 200;
+      G.minigame.pointer(x, y, 'down');
+    });
+  }
+
+  // settings
+  safeOn('btn-save-ai', 'onclick', saveSettings);
+  safeOn('btn-test-ai', 'onclick', testAI);
+}
+
+/* ============================================================
+   Главный цикл
+   ============================================================ */
+var lastT = 0;
+function mainLoop(ts) {
+  if (!lastT) lastT = ts;
+  var dt = Math.min(0.1, (ts - lastT) / 1000);
+  lastT = ts;
+  G.t += dt;
+  if (G.talking.a > 0) G.talking.a -= dt;
+  if (G.talking.b > 0) G.talking.b -= dt;
+
+  var inter = INTERACTIVES[G.location];
+  if (inter && G.locationState[G.location]) inter.update(dt, G.locationState[G.location]);
+
+  if (G.state === 'play') renderScene(dt);
+
+  if (G.state === 'creator') renderCreatorPreview();
+
+  if (G.state === 'minigame' && G.minigame) {
+    G.minigame.update(dt);
+    var mg = $('cv-minigame');
+    if (mg) {
+      var ctx = mg.getContext('2d');
+      ctx.imageSmoothingEnabled = false;
+      G.minigame.render(ctx);
+    }
+  }
+
+  if (G.state === 'menu') drawLogo();
+
+  requestAnimationFrame(mainLoop);
+}
+function drawLogo() {
+  var cv = $('logo-pix');
+  if (!cv) return;
+  var ctx = cv.getContext('2d');
+  if (ctx._lastDraw && G.t - ctx._lastDraw < 0.12) return;
+  ctx._lastDraw = G.t;
+  ctx.clearRect(0, 0, 96, 96);
+  ctx.imageSmoothingEnabled = false;
+  drawAvatarScaled(ctx, 0, 12, 6, G.profile, { t: G.t });
+}
+
+/* ============================================================
+   Обработка сворачивания / восстановления Mini App
+   ============================================================ */
+function setupVisibilityHandler() {
   var wasInRoom = false;
-  
   function onVisibilityChange() {
     if (document.visibilityState === 'hidden') {
-      hiddenAt = Date.now();
       try {
-        if (typeof net !== 'undefined' && net && net.conn && net.conn.open) {
-          wasInRoom = !!(typeof roomCode !== 'undefined' && roomCode && typeof roomState !== 'undefined' && roomState && roomState.players && roomState.players.length > 0);
+        if (net && net.conn && net.conn.open) {
+          wasInRoom = !!(net.roomCode);
         }
-      } catch(e) {}
+      } catch (e) {}
     } else if (document.visibilityState === 'visible') {
-      setTimeout(function() {
+      setTimeout(function () {
         try {
-          if (typeof net !== 'undefined' && net) {
-            if (net.peer && !net.peer.destroyed) {
-              if (net.conn && !net.conn.open && wasInRoom && typeof roomCode !== 'undefined' && roomCode) {
-                if (!net.isHost) {
-                  console.log('[net] reconnecting after resume...');
-                  net.close();
-                  setTimeout(function() { net.join(roomCode); }, 500);
-                }
-              }
-            } else if (wasInRoom && typeof roomCode !== 'undefined' && roomCode) {
-              console.log('[net] recreating peer after resume...');
-              if (typeof net.close === 'function') net.close();
-              setTimeout(function() {
-                if (net.isHost) net.host(roomCode);
-                else net.join(roomCode);
-              }, 500);
-            }
+          if (!net) return;
+          var code = net.roomCode;
+          if (!code) return;
+          if (net.peer && net.peer.destroyed && wasInRoom) {
+            if (net.isHost) net.host(code);
+            else net.join(code);
+          } else if (net.conn && !net.conn.open && wasInRoom && !net.isHost) {
+            net.close();
+            setTimeout(function () { net.join(code); }, 500);
           }
-        } catch(e) {
-          console.error('[resume]', e);
-        }
+        } catch (e) { console.error('[resume]', e); }
       }, 300);
     }
   }
-  
-  if (typeof document !== 'undefined') {
-    document.addEventListener('visibilitychange', onVisibilityChange);
-  }
-  
-  if (typeof TG !== 'undefined' && TG) {
+  document.addEventListener('visibilitychange', onVisibilityChange);
+  if (TG && typeof TG.onEvent === 'function') {
     try {
-      if (typeof TG.onEvent === 'function') {
-        TG.onEvent('viewportChanged', function() {
-          if (document.visibilityState === 'visible') {
-            setTimeout(onVisibilityChange, 100);
-          }
-        });
-        TG.onEvent('activated', function() {
-          setTimeout(function() {
-            try {
-              if (typeof net !== 'undefined' && net && net.peer && net.peer.destroyed && wasInRoom && typeof roomCode !== 'undefined' && roomCode) {
-                if (typeof net.close === 'function') net.close();
-                setTimeout(function() {
-                  if (net.isHost) net.host(roomCode);
-                  else net.join(roomCode);
-                }, 500);
-              }
-            } catch(e) {}
-          }, 200);
-        });
-      }
-    } catch(e) {}
+      TG.onEvent('activated', function () {
+        setTimeout(onVisibilityChange, 200);
+      });
+    } catch (e) {}
   }
-})();
 }
+
+/* ============================================================
+   Инициализация
+   ============================================================ */
+function init() {
+  loadSettings();
+  setupSceneCanvas();
+  setupNetHandlers();
+  setupVisibilityHandler();
+  bindAll();
+
+  var bs = $('boot-status');
+  if (bs) bs.style.display = 'none';
+
+  var sp = getStartParam();
+  if (sp) {
+    var inp = $('inp-code');
+    if (inp) inp.value = sp.toUpperCase().slice(0, 4);
+    go('join');
+  } else {
+    go('menu');
+  }
+
+  requestAnimationFrame(mainLoop);
+}
+
+init();
+
 })();
