@@ -1,5 +1,8 @@
-/* Атмосфера — RP-свидание. Один файл, без ES-модулей.
-   Интеграция Telegram Mini App: init, expand, safe-area, startapp, share. */
+/* ============================================================
+   Атмосфера — RP-свидание. Один файл, без ES-модулей.
+   v1.1: STUN/TURN для PeerJS + устойчивость к сворачиванию
+   Telegram Mini App.
+   ============================================================ */
 (function () {
 'use strict';
 
@@ -11,24 +14,18 @@ var TG_USER = TG && TG.initDataUnsafe && TG.initDataUnsafe.user;
 var START_PARAM = TG && TG.initDataUnsafe && TG.initDataUnsafe.start_param;
 var DEFAULT_NAME = (TG_USER && TG_USER.first_name) ? String(TG_USER.first_name).slice(0, 14) : 'Ты';
 
-/* ⚠️ Настрой под свой бот (см. README). Если пусто — кнопка «Поделиться»
-   просто копирует код в буфер. */
-var BOT_USERNAME = '';   // напр. 'atmosfera_bot' (без @)
-var BOT_APPNAME  = '';   // если создавал через /newapp — короткое имя, напр. 'atmosfera'
+var BOT_USERNAME = '';
+var BOT_APPNAME  = '';
 
 if (TG) {
   try {
     TG.ready();
     TG.expand();
     if (TG.disableVerticalSwipes) TG.disableVerticalSwipes();
-    if (TG.enableClosingConfirmation) {
-      // не мешаем игре, но пусть случайно не закроют на середине
-    }
     document.body.classList.add('tg-mini');
   } catch (e) { /* no-op */ }
 }
 
-/* fallback: тестировать startapp в браузере через ?startapp=ABCD */
 function getStartParam() {
   if (START_PARAM) return START_PARAM;
   try {
@@ -40,6 +37,9 @@ function getStartParam() {
 
 /* ============================================================
    ПЕРЕХВАТ ОШИБОК
+   Фильтруем cross-origin "Script error." — это не наша ошибка,
+   а шум от CDN (PeerJS/Telegram SDK). Показываем баннер только
+   на настоящие падения.
    ============================================================ */
 function showFatal(label, detail) {
   var el = document.getElementById('boot-status');
@@ -57,12 +57,27 @@ function showFatal(label, detail) {
     el.textContent = label + '\n' + (detail || '');
   } else console.error(label, detail);
 }
+
 window.addEventListener('error', function (e) {
-  if (e.message) showFatal('Ошибка:', e.message + '\n' + (e.filename || '') + ':' + (e.lineno || ''));
+  // Игнорируем cross-origin ошибки — они не имеют .filename и пишут "Script error."
+  if (!e.filename && (!e.message || e.message === 'Script error.')) {
+    console.warn('[cross-origin error ignored]', e);
+    return;
+  }
+  if (e.message) {
+    showFatal('Ошибка:', e.message + '\n' + (e.filename || '') + ':' + (e.lineno || ''));
+  }
 });
+
 window.addEventListener('unhandledrejection', function (e) {
   var r = e.reason;
-  showFatal('Promise:', r && (r.message || r.stack || String(r)) || '');
+  var msg = r && (r.message || r.stack || String(r)) || '';
+  // Промисы тоже могут отклоняться cross-origin кодом
+  if (msg === 'Script error.' || msg === '') {
+    console.warn('[cross-origin rejection ignored]', e);
+    return;
+  }
+  showFatal('Promise:', msg);
 });
 
 /* ============================================================
@@ -727,22 +742,36 @@ function makeEpilogue(ctx) {
 }
 
 /* ============================================================
-   Сеть
+   СЕТЬ С STUN/TURN
    ============================================================ */
+var ICE_CONFIG = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    // Бесплатный публичный TURN (openrelay.metered.ca)
+    { urls: 'turn:openrelay.metered.ca:80',  username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:3478', username: 'openrelayproject', credential: 'openrelayproject' }
+  ],
+  iceTransportPolicy: 'all'
+};
+
 function NetCtor() {
   this.peer = null; this.conn = null; this.isHost = false; this.roomCode = null;
   this.onMessage = function () {}; this.onOpen = function () {}; this.onClose = function () {};
 }
 NetCtor.prototype._destroyPeer = function () { if (this.peer) { try { this.peer.destroy(); } catch (e) {} this.peer = null; } };
 NetCtor.prototype._waitForPeerJs = function (ms) {
-  ms = ms || 6000;
+  ms = ms || 8000;
   if (typeof window.Peer !== 'undefined') return Promise.resolve(true);
   return new Promise(function (resolve) {
     var start = Date.now();
     var step = function () {
       if (typeof window.Peer !== 'undefined') return resolve(true);
       if (Date.now() - start > ms) return resolve(false);
-      setTimeout(step, 120);
+      setTimeout(step, 150);
     };
     step();
   });
@@ -752,7 +781,7 @@ NetCtor.prototype.host = function (code) {
   return this._waitForPeerJs().then(function (ok) {
     if (!ok) { self.onMessage({ t: 'error', text: 'PeerJS не загрузился.' }); return false; }
     self.isHost = true; self.roomCode = code; self._destroyPeer();
-    self.peer = new window.Peer('atmos-' + code, { debug: 0 });
+    self.peer = new window.Peer('atmos-' + code, { debug: 0, config: ICE_CONFIG });
     self.peer.on('open', function () { self.onOpen(); });
     self.peer.on('error', function (e) { self.onMessage({ t: 'error', text: 'Сеть: ' + (e.type || 'ошибка') }); });
     self.peer.on('connection', function (conn) {
@@ -767,7 +796,7 @@ NetCtor.prototype.join = function (code) {
   return this._waitForPeerJs().then(function (ok) {
     if (!ok) { self.onMessage({ t: 'error', text: 'PeerJS не загрузился.' }); return false; }
     self.isHost = false; self.roomCode = code; self._destroyPeer();
-    self.peer = new window.Peer({ debug: 0 });
+    self.peer = new window.Peer({ debug: 0, config: ICE_CONFIG });
     self.peer.on('open', function () {
       var conn = self.peer.connect('atmos-' + code, { reliable: true });
       self.conn = conn; self._wire(conn);
@@ -783,8 +812,15 @@ NetCtor.prototype._wire = function (conn) {
   conn.on('close', function () { self.onClose(); });
   conn.on('error', function () { self.onClose(); });
 };
-NetCtor.prototype.send = function (obj) { if (this.conn && this.conn.open) { try { this.conn.send(JSON.stringify(obj)); } catch (e) {} } };
-NetCtor.prototype.close = function () { try { if (this.conn) this.conn.close(); } catch (e) {} this.conn = null; this._destroyPeer(); };
+NetCtor.prototype.send = function (obj) {
+  if (this.conn && this.conn.open) {
+    try { this.conn.send(JSON.stringify(obj)); } catch (e) { console.warn('[send]', e); }
+  }
+};
+NetCtor.prototype.close = function () {
+  try { if (this.conn) this.conn.close(); } catch (e) {}
+  this.conn = null; this._destroyPeer();
+};
 function makeCode() {
   var A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789', s = '';
   for (var i = 0; i < 4; i++) s += A[Math.floor(Math.random() * A.length)];
@@ -1138,9 +1174,7 @@ function toast(msg) {
   toast._t = setTimeout(function () { el.classList.remove('show'); }, 2400);
 }
 
-/* ============================================================
-   ВИДЕО
-   ============================================================ */
+/* ---- Видео ---- */
 function parseYouTubeId(url) {
   if (!url) return null;
   var s = String(url).trim();
@@ -1154,25 +1188,12 @@ function parseYouTubeId(url) {
   if (m) return m[1];
   return null;
 }
-
-function showCinemaOverlay() {
-  var el = $('cinema-overlay');
-  if (el) { el.classList.add('active'); el.innerHTML = ''; }
-}
-function hideCinemaOverlay() {
-  var el = $('cinema-overlay');
-  if (el) { el.classList.remove('active'); el.innerHTML = ''; }
-}
-
+function showCinemaOverlay() { var el = $('cinema-overlay'); if (el) { el.classList.add('active'); el.innerHTML = ''; } }
+function hideCinemaOverlay() { var el = $('cinema-overlay'); if (el) { el.classList.remove('active'); el.innerHTML = ''; } }
 function youtubeCmd(func, args) {
   if (!G.video.el || G.video.kind !== 'youtube') return;
-  try {
-    G.video.el.contentWindow.postMessage(JSON.stringify({
-      event: 'command', func: func, args: args || []
-    }), '*');
-  } catch (e) {}
+  try { G.video.el.contentWindow.postMessage(JSON.stringify({ event: 'command', func: func, args: args || [] }), '*'); } catch (e) {}
 }
-
 function stopVideo(broadcast) {
   if (G.video.el) {
     try {
@@ -1183,11 +1204,8 @@ function stopVideo(broadcast) {
   G.video = { active: false, kind: null, src: null, el: null, wallStart: 0, videoStart: 0, playing: false, lastStateId: null, pendingFileSrc: null, pendingState: null };
   hideCinemaOverlay();
   updateInteractiveBar();
-  if (broadcast !== false && G.mode === 'host' && net.conn && net.conn.open) {
-    net.send({ t: 'video-stop' });
-  }
+  if (broadcast !== false && G.mode === 'host' && net.conn && net.conn.open) net.send({ t: 'video-stop' });
 }
-
 function startVideo(kind, src, opts, broadcast) {
   opts = opts || {};
   if (G.video.el) {
@@ -1197,20 +1215,16 @@ function startVideo(kind, src, opts, broadcast) {
     } catch (e) {}
   }
   showCinemaOverlay();
-  var overlay = $('cinema-overlay');
-  if (!overlay) return;
-
+  var overlay = $('cinema-overlay'); if (!overlay) return;
   var wallStart = opts.wallStart || Date.now();
   var videoStart = opts.videoStart || 0;
   var el;
-
   if (kind === 'youtube') {
     var id = parseYouTubeId(src) || src;
     var expected = videoStart;
     if (opts.wallStart) expected += (Date.now() - opts.wallStart) / 1000;
     el = document.createElement('iframe');
-    el.src = 'https://www.youtube.com/embed/' + id +
-      '?enablejsapi=1&autoplay=1&rel=0&modestbranding=1&playsinline=1&start=' + Math.max(0, Math.floor(expected));
+    el.src = 'https://www.youtube.com/embed/' + id + '?enablejsapi=1&autoplay=1&rel=0&modestbranding=1&playsinline=1&start=' + Math.max(0, Math.floor(expected));
     el.allow = 'autoplay; encrypted-media; picture-in-picture; fullscreen';
     el.allowFullscreen = true;
     el.setAttribute('frameborder', '0');
@@ -1231,22 +1245,17 @@ function startVideo(kind, src, opts, broadcast) {
       el.play().catch(function () { el.muted = true; el.play().catch(function(){}); });
     });
     el.addEventListener('play', function () {
-      G.video.wallStart = Date.now();
-      G.video.videoStart = el.currentTime;
-      G.video.playing = true;
+      G.video.wallStart = Date.now(); G.video.videoStart = el.currentTime; G.video.playing = true;
       if (G.mode === 'host' && net.conn && net.conn.open) sendVideoState();
     });
     el.addEventListener('pause', function () {
       if (G.video.active) {
         G.video.playing = false;
-        if (G.mode === 'host' && net.conn && net.conn.open) {
-          net.send({ t: 'video-pause', time: el.currentTime });
-        }
+        if (G.mode === 'host' && net.conn && net.conn.open) net.send({ t: 'video-pause', time: el.currentTime });
       }
     });
     el.addEventListener('seeked', function () {
-      G.video.wallStart = Date.now();
-      G.video.videoStart = el.currentTime;
+      G.video.wallStart = Date.now(); G.video.videoStart = el.currentTime;
       if (G.mode === 'host' && net.conn && net.conn.open) sendVideoState();
     });
     G.video = { active: true, kind: kind, src: src, el: el, wallStart: wallStart, videoStart: videoStart, playing: true, lastStateId: null, pendingFileSrc: null, pendingState: null };
@@ -1254,75 +1263,44 @@ function startVideo(kind, src, opts, broadcast) {
   updateInteractiveBar();
   if (broadcast !== false && G.mode === 'host' && net.conn && net.conn.open) sendVideoState();
 }
-
 function sendVideoState() {
   if (G.mode !== 'host' || !net.conn || !net.conn.open || !G.video.active) return;
-  net.send({
-    t: 'video-state',
-    kind: G.video.kind,
-    src: G.video.kind === 'file' ? null : G.video.src,
-    wallStart: G.video.wallStart,
-    videoStart: G.video.videoStart,
-    playing: G.video.playing
-  });
+  net.send({ t: 'video-state', kind: G.video.kind, src: G.video.kind === 'file' ? null : G.video.src,
+    wallStart: G.video.wallStart, videoStart: G.video.videoStart, playing: G.video.playing });
 }
-
 function applyVideoState(msg) {
   if (!msg || !msg.kind) { stopVideo(false); return; }
-
   if (msg.kind === 'file') {
     if (G.video.pendingFileSrc) {
-      var src = G.video.pendingFileSrc;
-      G.video.pendingFileSrc = null;
+      var src = G.video.pendingFileSrc; G.video.pendingFileSrc = null;
       startVideo('file', src, { wallStart: msg.wallStart, videoStart: msg.videoStart }, false);
-    } else {
-      G.video.pendingState = msg;
-      toast('Ждём загрузку видео…');
-    }
+    } else { G.video.pendingState = msg; toast('Ждём загрузку видео…'); }
     return;
   }
-
-  if (G.video.active && G.video.kind === msg.kind && G.video.src === msg.src) {
-    correctDrift(msg);
-    return;
-  }
+  if (G.video.active && G.video.kind === msg.kind && G.video.src === msg.src) { correctDrift(msg); return; }
   startVideo(msg.kind, msg.src, { wallStart: msg.wallStart, videoStart: msg.videoStart }, false);
 }
-
 function correctDrift(msg) {
   if (!G.video.el) return;
   var stateId = msg.wallStart + '|' + (msg.playing ? '1' : '0') + '|' + (msg.videoStart || 0);
   var isNewState = G.video.lastStateId !== stateId;
   G.video.lastStateId = stateId;
-
   if (msg.playing === false) {
-    if (G.video.kind !== 'youtube') {
-      try { G.video.el.pause(); G.video.el.currentTime = msg.videoStart || 0; } catch (e) {}
-    } else youtubeCmd('pauseVideo');
+    if (G.video.kind !== 'youtube') { try { G.video.el.pause(); G.video.el.currentTime = msg.videoStart || 0; } catch (e) {} }
+    else youtubeCmd('pauseVideo');
     return;
   }
-
   var expected = (msg.videoStart || 0);
   if (msg.wallStart) expected += (Date.now() - msg.wallStart) / 1000;
-
   if (G.video.kind !== 'youtube') {
     var ct = 0;
     try { ct = G.video.el.currentTime || 0; } catch (e) {}
-    if (Math.abs(ct - expected) > 2.0) {
-      try { G.video.el.currentTime = expected; } catch (e) {}
-    }
-    if (G.video.el.paused) {
-      G.video.el.play().catch(function () { G.video.el.muted = true; G.video.el.play().catch(function(){}); });
-    }
+    if (Math.abs(ct - expected) > 2.0) { try { G.video.el.currentTime = expected; } catch (e) {} }
+    if (G.video.el.paused) G.video.el.play().catch(function () { G.video.el.muted = true; G.video.el.play().catch(function(){}); });
   } else {
-    if (isNewState) {
-      youtubeCmd('seekTo', [expected, true]);
-      youtubeCmd('playVideo');
-    }
+    if (isNewState) { youtubeCmd('seekTo', [expected, true]); youtubeCmd('playVideo'); }
   }
 }
-
-/* АУДИО (клуб) */
 function stopAudio(broadcast) {
   if (G.audioEl) {
     try { G.audioEl.pause(); G.audioEl.src = ''; } catch (e) {}
@@ -1332,7 +1310,6 @@ function stopAudio(broadcast) {
   updateInteractiveBar();
   if (broadcast !== false && G.mode === 'host' && net.conn && net.conn.open) net.send({ t: 'audio-stop' });
 }
-
 function startAudio(src, opts, broadcast) {
   opts = opts || {};
   G.audioEl = G.audioEl || $('club-player');
@@ -1345,27 +1322,18 @@ function startAudio(src, opts, broadcast) {
     try { if (startT > 0.5 && (!G.audioEl.duration || startT < G.audioEl.duration - 1)) G.audioEl.currentTime = startT; } catch (e) {}
     G.audioEl.play().catch(function () {});
   }, { once: true });
-
-  G.audioState = {
-    active: true,
-    wallStart: opts.wallStart || Date.now(),
-    videoStart: opts.videoStart || 0,
-    playing: true
-  };
+  G.audioState = { active: true, wallStart: opts.wallStart || Date.now(), videoStart: opts.videoStart || 0, playing: true };
   updateInteractiveBar();
   if (broadcast !== false && G.mode === 'host' && net.conn && net.conn.open) {
     net.send({ t: 'audio-state', wallStart: G.audioState.wallStart, videoStart: G.audioState.videoStart, playing: true });
   }
 }
-
 function applyAudioState(msg) {
   if (!msg.active) { stopAudio(false); return; }
   var expected = (msg.videoStart || 0);
   if (msg.wallStart) expected += (Date.now() - msg.wallStart) / 1000;
   if (G.audioState.active && G.audioEl) {
-    if (Math.abs((G.audioEl.currentTime || 0) - expected) > 2.0) {
-      try { G.audioEl.currentTime = expected; } catch (e) {}
-    }
+    if (Math.abs((G.audioEl.currentTime || 0) - expected) > 2.0) { try { G.audioEl.currentTime = expected; } catch (e) {} }
     if (G.audioEl.paused) G.audioEl.play().catch(function(){});
   }
 }
@@ -1378,21 +1346,15 @@ setInterval(function () {
   }
 }, 4000);
 
-/* Файл-шаринг */
 var FILE_CHUNK = 16384;
 var FILE_MAX = 50 * 1024 * 1024;
 var incoming = null;
-
 function transferFile(file, type, onDone) {
   var total = Math.ceil(file.size / FILE_CHUNK);
   net.send({ t: 'file-start', name: file.name, type: type, size: file.size, total: total });
   var idx = 0;
   function sendNext() {
-    if (idx >= total) {
-      net.send({ t: 'file-end' });
-      if (typeof onDone === 'function') onDone();
-      return;
-    }
+    if (idx >= total) { net.send({ t: 'file-end' }); if (typeof onDone === 'function') onDone(); return; }
     var slice = file.slice(idx * FILE_CHUNK, (idx + 1) * FILE_CHUNK);
     var reader = new FileReader();
     reader.onload = function () {
@@ -1406,864 +1368,21 @@ function transferFile(file, type, onDone) {
   sendNext();
   toast('Передаю файл…');
 }
-
 function handleVideoFile(file) {
   if (file.size > FILE_MAX) { toast('Файл больше 50 МБ'); return; }
   var type = file.type || 'video/mp4';
   var blobUrl = URL.createObjectURL(file);
   startVideo('file', blobUrl, {}, false);
-  G.video.wallStart = Date.now();
-  G.video.videoStart = 0;
+  G.video.wallStart = Date.now(); G.video.videoStart = 0;
   if (G.mode === 'host' && net.conn && net.conn.open) {
     transferFile(file, type, function () {
       net.send({ t: 'video-state', kind: 'file', src: null, wallStart: G.video.wallStart, videoStart: G.video.videoStart, playing: true });
     });
   }
 }
-
 function handleAudioFile(file) {
   if (file.size > FILE_MAX) { toast('Файл больше 50 МБ'); return; }
   var type = file.type || 'audio/mpeg';
   var blobUrl = URL.createObjectURL(file);
   startAudio(blobUrl, {}, false);
-  G.audioState.wallStart = Date.now();
-  G.audioState.videoStart = 0;
-  if (G.mode === 'host' && net.conn && net.conn.open) {
-    transferFile(file, type, function () {
-      net.send({ t: 'audio-state', wallStart: G.audioState.wallStart, videoStart: G.audioState.videoStart, playing: true });
-    });
-  }
-}
-
-function playReceivedFile(blob, type) {
-  var isVideo = type.indexOf('video/') === 0;
-  var isAudio = type.indexOf('audio/') === 0;
-  if (isVideo) {
-    var url = URL.createObjectURL(blob);
-    if (G.video.pendingState && G.video.pendingState.kind === 'file') {
-      var st = G.video.pendingState;
-      G.video.pendingState = null;
-      G.video.pendingFileSrc = null;
-      startVideo('file', url, { wallStart: st.wallStart, videoStart: st.videoStart }, false);
-    } else G.video.pendingFileSrc = url;
-  } else if (isAudio) {
-    var aurl = URL.createObjectURL(blob);
-    startAudio(aurl, { wallStart: G.audioState.wallStart || Date.now(), videoStart: 0 }, false);
-  }
-}
-
-function updateInteractiveBar() {
-  var isHost = (G.mode === 'host' || G.mode === 'solo');
-  var atCinema = G.location === 'cinema';
-  var atClub = G.location === 'club';
-  var vActive = G.video.active;
-  var aActive = G.audioState.active;
-
-  var bFile = $('btn-show-video');
-  var bLink = $('btn-show-link');
-  var bTrack = $('btn-show-track');
-  var bStop = $('btn-stop-media');
-
-  if (bFile) bFile.style.display = (atCinema && isHost && !vActive) ? '' : 'none';
-  if (bLink) bLink.style.display = (atCinema && isHost && !vActive) ? '' : 'none';
-  if (bTrack) bTrack.style.display = (atClub && isHost && !aActive) ? '' : 'none';
-  if (bStop) bStop.style.display = (vActive || aActive) ? '' : 'none';
-
-  var status = $('media-status');
-  if (status) {
-    if (vActive) status.textContent = '🎬 Видео на экране' + (G.video.kind === 'youtube' ? ' · YouTube' : '');
-    else if (aActive) status.textContent = '🎵 Трек играет';
-    else if (atCinema) status.textContent = isHost ? 'Выбери файл или вставь ссылку' : 'Ждём, когда партнёр включит видео';
-    else if (atClub) status.textContent = isHost ? 'Включи свой трек' : 'Ждём, когда партнёр включит трек';
-    else status.textContent = '';
-  }
-}
-
-/* ============================================================
-   Настройки AI
-   ============================================================ */
-function loadAISettings() {
-  try {
-    var raw = localStorage.getItem('atmos-ai');
-    if (raw) {
-      var saved = JSON.parse(raw);
-      if (saved.apiKey) G.ai.apiKey = saved.apiKey;
-      if (saved.model) G.ai.model = saved.model;
-    }
-  } catch (e) {}
-  var k = $('inp-apikey'); if (k) k.value = G.ai.apiKey || '';
-  var m = $('inp-model'); if (m) m.value = G.ai.model || 'openrouter/free';
-  updateSettingsStatus();
-}
-function saveAISettings() {
-  var k = $('inp-apikey'), m = $('inp-model');
-  G.ai.apiKey = (k && k.value || '').trim();
-  G.ai.model = (m && m.value || '').trim() || 'openrouter/free';
-  try { localStorage.setItem('atmos-ai', JSON.stringify(G.ai)); } catch (e) {}
-  updateSettingsStatus();
-}
-function updateSettingsStatus() {
-  var el = $('settings-status'); if (!el) return;
-  if (G.ai.apiKey) { el.textContent = 'Ключ задан. Модель: ' + (G.ai.model || 'openrouter/free'); el.style.color = 'var(--ok)'; }
-  else { el.textContent = 'Ключ не задан. Игра работает в офлайн-режиме.'; el.style.color = ''; }
-}
-function testAI() {
-  var k = $('inp-apikey'), m = $('inp-model');
-  var key = (k && k.value || '').trim();
-  var model = (m && m.value || '').trim() || 'openrouter/free';
-  var status = $('settings-status');
-  if (!status) return;
-  if (!key) { status.textContent = 'Сначала введи ключ.'; status.style.color = 'var(--danger)'; return; }
-  status.textContent = 'Проверяем…'; status.style.color = '';
-  fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': 'Bearer ' + key,
-      'HTTP-Referer': window.location.origin || 'http://localhost',
-      'X-Title': 'Atmosfera'
-    },
-    body: JSON.stringify({ model: model, messages: [{ role: 'user', content: 'Ответь одним словом: работает.' }], max_tokens: 10 })
-  }).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-  .then(function (j) {
-    var text = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
-    status.textContent = text ? '✓ Соединение работает' : '✓ Ответ пустой';
-    status.style.color = 'var(--ok)';
-  }).catch(function (e) {
-    status.textContent = '✗ ' + (e.message || 'не удалось подключиться');
-    status.style.color = 'var(--danger)';
-  });
-}
-
-function initMinigamesToggle() {
-  var saved = localStorage.getItem('atmos-minigames');
-  G.minigamesEnabled = saved !== 'false';
-  var cb = $('chk-minigames');
-  if (cb) {
-    cb.checked = G.minigamesEnabled;
-    cb.onchange = function () {
-      G.minigamesEnabled = cb.checked;
-      try { localStorage.setItem('atmos-minigames', cb.checked ? 'true' : 'false'); } catch (e) {}
-    };
-  }
-}
-
-/* ============================================================
-   Логотип / конструктор
-   ============================================================ */
-function drawLogo() {
-  var cv = $('logo-pix'); if (!cv || !cv.getContext) return;
-  cv.width = 96; cv.height = 96;
-  var ctx = cv.getContext('2d');
-  ctx.imageSmoothingEnabled = false; ctx.clearRect(0, 0, 96, 96);
-  drawAvatarScaled(ctx, 4, 20, 3.4, { skin:0, hair:0, hairColor:1, eyes:0, eyeColor:0, shirt:0, shirtColor:0, acc:0 });
-  drawAvatarScaled(ctx, 50, 20, 3.4, { skin:2, hair:1, hairColor:4, eyes:0, eyeColor:2, shirt:2, shirtColor:4, acc:9 });
-  ctx.fillStyle = P.pink;
-  ctx.fillRect(42, 30, 4, 4); ctx.fillRect(38, 34, 12, 3); ctx.fillRect(43, 34, 2, 12);
-}
-
-var CREATOR_FIELDS = [
-  { key:'skin', label:'Кожа', count: function () { return SKIN.length; }, name: function (i) { return 'Тон ' + (i + 1); } },
-  { key:'hair', label:'Причёска', count: function () { return HAIR_STYLES.length; }, name: function (i) { return HAIR_NAMES[HAIR_STYLES[i]]; } },
-  { key:'hairColor', label:'Цвет волос', count: function () { return HAIR.length; }, name: function (i) { return 'Цвет ' + (i + 1); } },
-  { key:'eyes', label:'Глаза', count: function () { return EYE_STYLES.length; }, name: function (i) { return EYE_NAMES[EYE_STYLES[i]]; } },
-  { key:'eyeColor', label:'Цвет глаз', count: function () { return EYE_COLORS.length; }, name: function (i) { return 'Цвет ' + (i + 1); } },
-  { key:'shirt', label:'Одежда', count: function () { return SHIRT_STYLES.length; }, name: function (i) { return SHIRT_NAMES[SHIRT_STYLES[i]]; } },
-  { key:'shirtColor', label:'Цвет одежды', count: function () { return SHIRT_COLORS.length; }, name: function (i) { return 'Цвет ' + (i + 1); } },
-  { key:'acc', label:'Аксессуар', count: function () { return ACCESSORIES.length; }, name: function (i) { return ACC_NAMES[ACCESSORIES[i]]; } }
-];
-function buildCreator() {
-  var wrap = $('creator-controls'); if (!wrap) return; wrap.innerHTML = '';
-  var nameRow = document.createElement('div'); nameRow.className = 'row';
-  var nameLabel = document.createElement('span'); nameLabel.className = 'name'; nameLabel.textContent = 'Имя';
-  nameRow.appendChild(nameLabel);
-  var inp = document.createElement('input');
-  inp.className = 'input';
-  inp.style.padding = '6px 10px'; inp.style.fontSize = '13px';
-  inp.value = G.profile.name === DEFAULT_NAME ? '' : G.profile.name;
-  inp.placeholder = 'Имя'; inp.maxLength = 14;
-  inp.oninput = function () { G.profile.name = inp.value.trim() || DEFAULT_NAME; };
-  nameRow.appendChild(inp); wrap.appendChild(nameRow);
-  CREATOR_FIELDS.forEach(function (f) {
-    var row = document.createElement('div'); row.className = 'row';
-    var label = document.createElement('span'); label.className = 'name'; label.textContent = f.label;
-    var left = document.createElement('button'); left.className = 'arrow'; left.textContent = '◀';
-    var val = document.createElement('span'); val.className = 'val';
-    var right = document.createElement('button'); right.className = 'arrow'; right.textContent = '▶';
-    var total = f.count();
-    var update = function () { val.textContent = f.name(G.profile[f.key] % total); };
-    left.onclick = function () { G.profile[f.key] = (G.profile[f.key] - 1 + total) % total; update(); };
-    right.onclick = function () { G.profile[f.key] = (G.profile[f.key] + 1) % total; update(); };
-    update();
-    row.appendChild(label); row.appendChild(left); row.appendChild(val); row.appendChild(right);
-    wrap.appendChild(row);
-  });
-}
-function drawPreview() {
-  var cv = $('cv-preview'); if (!cv || !cv.getContext) return;
-  var ctx = cv.getContext('2d');
-  ctx.imageSmoothingEnabled = false;
-  ctx.fillStyle = '#f4f4f5'; ctx.fillRect(0, 0, cv.width, cv.height);
-  drawAvatarScaled(ctx, 0, 0, 6, G.profile, { t: performance.now() / 1000, talking: false });
-}
-
-/* ============================================================
-   Сцена
-   ============================================================ */
-var scene = $('cv-scene');
-var sctx = scene ? scene.getContext('2d') : null;
-var mgCanvas = $('cv-minigame');
-var mgCtx = mgCanvas ? mgCanvas.getContext('2d') : null;
-
-function resetLocationState() {
-  var def = INTERACTIVES[G.location];
-  G.locationState = def && def.init ? def.init() : {};
-  if (G.location !== 'cinema' && G.video.active) stopVideo(true);
-  if (G.location !== 'club' && G.audioState.active) stopAudio(true);
-  updateInteractiveBar();
-}
-
-function renderScene() {
-  if (!sctx) return;
-  sctx.imageSmoothingEnabled = false; sctx.clearRect(0, 0, 160, 100);
-  getLocation(G.location).draw(sctx, G.t);
-  var inter = INTERACTIVES[G.location];
-  if (inter && inter.render) inter.render(sctx, G.locationState, G.t);
-  if (G.profile) drawAvatar(sctx, 34, 44, G.profile, { t: G.t, talking: G.talking.a > 0 });
-  if (G.peerProfile) drawAvatar(sctx, 110, 44, G.peerProfile, { t: G.t + 1.3, talking: G.talking.b > 0 });
-  sctx.font = '5px monospace'; sctx.textAlign = 'center';
-  sctx.fillStyle = 'rgba(0,0,0,0.55)'; sctx.fillRect(20, 36, 44, 6); sctx.fillRect(96, 36, 44, 6);
-  sctx.fillStyle = '#fff';
-  sctx.fillText((G.profile && G.profile.name || 'Ты').slice(0, 8), 42, 41);
-  sctx.fillText((G.peerProfile && G.peerProfile.name || '—').slice(0, 8), 118, 41);
-  drawMeters();
-  if (G.transition > 0) {
-    sctx.globalAlpha = G.transition; sctx.fillStyle = '#000'; sctx.fillRect(0, 0, 160, 80); sctx.globalAlpha = 1;
-  }
-}
-function drawMeters() {
-  if (!sctx) return;
-  sctx.fillStyle = '#0d0d0d'; sctx.fillRect(0, 80, 160, 20);
-  sctx.fillStyle = P.yellow; sctx.fillRect(4, 87, 5, 5);
-  sctx.fillStyle = '#0d0d0d'; sctx.fillRect(5, 88, 1, 1); sctx.fillRect(7, 88, 1, 1); sctx.fillRect(5, 90, 3, 1);
-  var mw = 64;
-  sctx.fillStyle = '#2a2a34'; sctx.fillRect(12, 88, mw, 4);
-  sctx.fillStyle = P.yellow; sctx.fillRect(12, 88, Math.round(mw * G.moodShown / 100), 4);
-  sctx.fillStyle = P.red;
-  sctx.fillRect(85, 87, 2, 1); sctx.fillRect(89, 87, 2, 1);
-  sctx.fillRect(84, 88, 7, 2); sctx.fillRect(85, 90, 5, 1);
-  sctx.fillRect(86, 91, 3, 1); sctx.fillRect(87, 92, 1, 1);
-  sctx.fillStyle = '#2a2a34'; sctx.fillRect(94, 88, mw, 4);
-  sctx.fillStyle = P.red; sctx.fillRect(94, 88, Math.round(mw * G.chemShown / 100), 4);
-}
-
-var last = performance.now();
-function frame(now) {
-  var dt = Math.min((now - last) / 1000, 0.05);
-  last = now;
-  update(dt);
-  if (G.state === S.play) renderScene();
-  if (G.state === S.creator) drawPreview();
-  if (G.state === S.minigame && G.minigame && mgCtx) {
-    G.minigame.update(dt);
-    G.minigame.render(mgCtx);
-  }
-  requestAnimationFrame(frame);
-}
-function update(dt) {
-  G.t += dt;
-  G.moodShown += (G.mood - G.moodShown) * Math.min(1, dt * 6);
-  G.chemShown += (G.chemistry - G.chemShown) * Math.min(1, dt * 6);
-  G.talking.a = Math.max(0, G.talking.a - dt);
-  G.talking.b = Math.max(0, G.talking.b - dt);
-  if (G.state === S.play) {
-    var inter = INTERACTIVES[G.location];
-    if (inter && inter.update) inter.update(dt, G.locationState);
-  }
-  if (G.transition > 0) {
-    G.transition = Math.max(0, G.transition - dt * 3.5);
-    if (G.transition === 0 && G.pendingLocation) {
-      G.location = G.pendingLocation; G.pendingLocation = null;
-      var ln = $('loc-name'); if (ln) ln.textContent = getLocation(G.location).name;
-      resetLocationState();
-    }
-  }
-}
-
-function pushMessage(who, text) { G.history.push({ who: who, text: text }); renderLog(); }
-function renderLog() {
-  var log = $('log'); if (!log) return;
-  log.innerHTML = '';
-  G.history.forEach(function (m) {
-    var el = document.createElement('div');
-    el.className = 'msg ' + (m.who === 'ai' ? 'narr' : m.who === 'sys' ? 'sys' : m.who === 'fail' ? 'fail' : 'act');
-    if (m.who === 'a') el.innerHTML = '<b>' + escapeHTML((G.profile && G.profile.name) || 'A') + ':</b> ' + escapeHTML(m.text);
-    else if (m.who === 'b') el.innerHTML = '<b>' + escapeHTML((G.peerProfile && G.peerProfile.name) || 'B') + ':</b> ' + escapeHTML(m.text);
-    else el.textContent = m.text;
-    log.appendChild(el);
-  });
-  log.scrollTop = log.scrollHeight;
-}
-function escapeHTML(s) {
-  return String(s).replace(/[&<>"']/g, function (c) { return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]; });
-}
-function isMyTurn() { if (G.mode === 'solo') return true; return G.turn === G.myRole; }
-function updateTurnUI() {
-  var label = $('turn-label'), send = $('btn-send'), inp = $('inp-action');
-  if (!label) return;
-  if (G.thinking) { label.textContent = 'Мир думает…'; if (send) send.disabled = true; if (inp) inp.disabled = true; return; }
-  if (isMyTurn()) { label.textContent = 'Твой ход'; if (send) send.disabled = false; if (inp) inp.disabled = false; }
-  else { label.textContent = 'Ход ' + ((G.peerProfile && G.peerProfile.name) || 'собеседника'); if (send) send.disabled = true; if (inp) inp.disabled = true; }
-}
-
-function startMinigame(id, action, opts) {
-  opts = opts || {};
-  G.minigame = new MiniGame(id, action, opts);
-  G.myResult = null; G.peerResult = null;
-  G.minigameCtx = { role: opts.role || 'solo', owner: opts.owner || 'a', solo: !!opts.solo };
-  G.minigame.onFinish = function (res) {
-    G.myResult = res;
-    var el = $('minigame-result');
-    if (el) { el.textContent = res === 'win' ? 'Успех!' : 'Провал'; el.className = 'mg-result show ' + res; }
-    if (!G.minigameCtx.solo) net.send({ t: 'minigame-result', ok: res === 'win' });
-    setTimeout(checkMinigameComplete, 500);
-    var h = $('minigame-hint'); if (h) h.textContent = G.minigameCtx.solo ? '—' : 'Ждём собеседника…';
-  };
-  var title = $('minigame-title'); if (title) title.textContent = G.minigame.def.title;
-  var hh = $('minigame-hint'); if (hh) hh.textContent = G.minigame.def.hint;
-  var res = $('minigame-result'); if (res) { res.textContent = ''; res.className = 'mg-result'; }
-  go(S.minigame);
-  if (G.minigameCtx.solo) {
-    setTimeout(function () {
-      if (!G.minigame || G.minigameCtx.solo !== true) return;
-      G.peerResult = Math.random() < 0.75 ? 'win' : 'lose';
-      checkMinigameComplete();
-    }, 2000 + Math.random() * 2500);
-  }
-}
-function checkMinigameComplete() {
-  if (!G.minigame) return;
-  if (G.myResult === null || G.peerResult === null) return;
-  var bothWin = G.myResult === 'win' && G.peerResult === 'win';
-  var ctx = G.minigameCtx;
-  var action = G.minigame.action;
-  var owner = ctx.owner;
-  G.minigame = null; G.myResult = null; G.peerResult = null;
-
-  if (bothWin) {
-    pushMessage(owner, action);
-    G.thinking = false;
-    G.turn = (owner === 'a') ? 'b' : 'a';
-    if (G.mode === 'solo') {
-      G.turn = 'a'; go(S.play);
-      runAtmosphere().then(updateTurnUI);
-      return;
-    }
-    if (G.mode === 'host') {
-      go(S.play);
-      if (owner === 'b') runAtmosphere().then(function () { net.send({ t: 'state', state: snapshotState() }); updateTurnUI(); });
-      else { net.send({ t: 'state', state: snapshotState() }); updateTurnUI(); }
-      return;
-    }
-    go(S.play);
-    G.thinking = true; updateTurnUI();
-    var lb = $('turn-label'); if (lb) lb.textContent = 'Ждём хоста…';
-    return;
-  }
-  G.mood = Math.max(0, G.mood - 3); G.thinking = false; G.turn = owner;
-  if (ctx.solo) { pushMessage('fail', 'Попытка не удалась.'); go(S.play); updateTurnUI(); return; }
-  if (ctx.role === 'host') {
-    pushMessage('fail', 'Попытка не удалась.');
-    net.send({ t: 'minigame-failed' });
-    net.send({ t: 'state', state: snapshotState() });
-    go(S.play); updateTurnUI();
-  }
-}
-
-function submitAction(text) {
-  text = (text || '').trim();
-  if (!text || G.thinking || !isMyTurn()) return;
-  var inp = $('inp-action'); if (inp) inp.value = '';
-  G.thinking = true; updateTurnUI();
-
-  if (!G.minigamesEnabled) {
-    var who = G.mode === 'solo' ? 'a' : G.myRole;
-    pushMessage(who, text);
-    G.talking[who] = 0.8;
-    if (G.mode === 'solo') { runAtmosphere().then(function () { G.turn = 'a'; G.thinking = false; updateTurnUI(); }); return; }
-    if (G.mode === 'host') { G.turn = 'b'; G.thinking = false; net.send({ t: 'state', state: snapshotState() }); updateTurnUI(); return; }
-    net.send({ t: 'action', text: text });
-    return;
-  }
-  var mgId = detectMinigame(text);
-  if (G.mode === 'solo') { startMinigame(mgId, text, { solo: true, owner: 'a' }); return; }
-  if (G.mode === 'host') { startMinigame(mgId, text, { role: 'host', owner: 'a' }); net.send({ t: 'minigame-start', id: mgId, action: text }); return; }
-  startMinigame(mgId, text, { role: 'guest', owner: 'b' });
-  net.send({ t: 'minigame-start', id: mgId, action: text });
-}
-
-function scenePointer(e, type) {
-  if (G.state !== S.play || !scene) return;
-  var rect = scene.getBoundingClientRect();
-  var x = (e.clientX - rect.left) / rect.width * 160;
-  var y = (e.clientY - rect.top) / rect.height * 100;
-  var inter = INTERACTIVES[G.location];
-  if (!inter || !inter.pointer) return;
-  var ev = inter.pointer(x, y, type, G.locationState);
-  if (ev && (G.mode === 'host' || G.mode === 'guest')) {
-    net.send({ t: 'interact', loc: G.location, action: ev.action, data: ev.data });
-  }
-}
-if (scene) {
-  scene.addEventListener('pointerdown', function (e) { e.preventDefault(); scenePointer(e, 'down'); });
-  scene.addEventListener('pointerup', function (e) { e.preventDefault(); scenePointer(e, 'up'); });
-}
-
-function runAtmosphere() {
-  var ctx = {
-    scenario: getLocation(G.location).name, location: G.location,
-    mood: G.mood, chemistry: G.chemistry, turn: G.turn,
-    profiles: { a: G.profile, b: G.peerProfile || G.profile },
-    history: G.history
-  };
-  return narrate(ctx).then(applyAtmosphere).catch(function () {
-    applyAtmosphere({ narration: 'Мир промолчал.', moodDelta: 0, chemDelta: 0, location: null });
-  });
-}
-function applyAtmosphere(res) {
-  G.mood = Math.max(0, Math.min(100, G.mood + (res.moodDelta || 0)));
-  G.chemistry = Math.max(0, Math.min(100, G.chemistry + (res.chemDelta || 0)));
-  if (res.location && res.location !== G.location) { G.pendingLocation = res.location; G.transition = 1; }
-  pushMessage('ai', res.narration);
-  G.talking.a = 0.6; G.talking.b = 0.6;
-  if (G.chemistry >= 95 || G.mood <= 5 || G.history.filter(function (m) { return m.who === 'ai'; }).length >= 12) endGame();
-}
-function snapshotState() {
-  return {
-    location: G.location, pendingLocation: G.pendingLocation, transition: G.transition,
-    mood: G.mood, chemistry: G.chemistry, turn: G.turn, history: G.history,
-    peerProfile: G.mode === 'host' ? G.peerProfile : G.profile
-  };
-}
-function applyState(st) {
-  if (!st) return;
-  G.thinking = false;
-  var locChanged = (st.location !== undefined && st.location !== G.location);
-  if (st.peerProfile) G.peerProfile = st.peerProfile;
-  if (st.location !== undefined) G.location = st.location;
-  if (st.pendingLocation !== undefined) G.pendingLocation = st.pendingLocation;
-  if (st.transition !== undefined) G.transition = st.transition;
-  if (st.mood !== undefined) G.mood = st.mood;
-  if (st.chemistry !== undefined) G.chemistry = st.chemistry;
-  if (st.turn !== undefined) G.turn = st.turn;
-  if (st.history) G.history = st.history;
-  var ln = $('loc-name'); if (ln) ln.textContent = getLocation(G.location).name;
-  if (locChanged) resetLocationState();
-  if (G.state === S.minigame) { G.minigame = null; G.myResult = null; G.peerResult = null; go(S.play); }
-  renderLog(); updateTurnUI();
-}
-function endGame() {
-  G.thinking = true; updateTurnUI();
-  makeEpilogue({
-    mood: G.mood, chemistry: G.chemistry,
-    profiles: { a: G.profile, b: G.peerProfile || G.profile },
-    location: getLocation(G.location).name
-  }).then(function (epi) {
-    G.over = { epilogue: epi, mood: Math.round(G.mood), chemistry: Math.round(G.chemistry) };
-    if (G.mode === 'host') net.send({ t: 'over', data: G.over });
-    if (G.mode === 'guest') return;
-    showOver(G.over);
-  });
-}
-function showOver(data) {
-  var ep = $('over-epilogue'); if (ep) ep.textContent = data.epilogue;
-  var st = $('over-stats');
-  if (st) st.innerHTML = '<div class="stat"><div class="num">' + data.mood + '</div><div class="cap">Настроение</div></div>' +
-    '<div class="stat"><div class="num">' + data.chemistry + '</div><div class="cap">Химия</div></div>';
-  var t = $('over-title');
-  if (t) t.textContent = data.chemistry > 75 ? 'Что-то началось' : data.chemistry > 40 ? 'Было неплохо' : 'Вечер закончился';
-  stopVideo(false); stopAudio(false);
-  go('over');
-}
-
-function startVoting() {
-  var shuffled = LOCATIONS.slice().sort(function () { return Math.random() - 0.5; });
-  G.voteChoices = shuffled.slice(0, 4).map(function (l) { return l.id; });
-  G.votes = { a: null, b: null };
-  clearTimeout(G.voteTimer);
-  if (G.mode === 'host') net.send({ t: 'vote-start', choices: G.voteChoices });
-  showVoteScreen(G.voteChoices);
-  if (G.mode === 'host' || G.mode === 'solo') {
-    G.voteTimer = setTimeout(function () {
-      if (G.votes.a === null) G.votes.a = G.voteChoices[Math.floor(Math.random() * 4)];
-      if (G.votes.b === null) G.votes.b = G.voteChoices[Math.floor(Math.random() * 4)];
-      if (G.mode === 'host') {
-        var w = pickWinner(G.votes.a, G.votes.b);
-        net.send({ t: 'vote-result', location: w });
-        finishVote(w);
-      } else finishVote(pickWinner(G.votes.a, G.votes.b));
-    }, 30000);
-  }
-}
-function showVoteScreen(choices) {
-  var vs = $('vote-status'); if (vs) vs.textContent = 'Выбери локацию';
-  var vr = $('vote-result'); if (vr) { vr.classList.remove('show'); vr.textContent = ''; }
-  var wrap = $('vote-choices'); if (!wrap) return; wrap.innerHTML = '';
-  choices.forEach(function (id) {
-    var loc = getLocation(id);
-    var card = document.createElement('button');
-    card.type = 'button'; card.className = 'vote-card'; card.dataset.id = id;
-    var cv = document.createElement('canvas');
-    cv.width = 160; cv.height = 80;
-    var c = cv.getContext('2d');
-    c.imageSmoothingEnabled = false;
-    loc.draw(c, 0);
-    card.appendChild(cv);
-    var lbl = document.createElement('div'); lbl.className = 'vote-label'; lbl.textContent = loc.name;
-    card.appendChild(lbl);
-    card.onclick = function () { castVote(id); };
-    wrap.appendChild(card);
-  });
-  go('vote');
-}
-function castVote(id) {
-  var myKey = (G.mode === 'host' || G.mode === 'solo') ? 'a' : 'b';
-  if (G.votes[myKey] !== null) return;
-  G.votes[myKey] = id;
-  var wrap = $('vote-choices');
-  if (wrap) Array.prototype.forEach.call(wrap.children, function (el) { el.classList.toggle('voted', el.dataset.id === id); });
-  var vs = $('vote-status'); if (vs) vs.textContent = (G.mode === 'solo') ? 'Готово…' : 'Ждём собеседника…';
-  if (G.mode === 'host' || G.mode === 'guest') net.send({ t: 'vote', choice: id });
-  if (G.mode === 'solo') {
-    if (G.votes.b === null) G.votes.b = G.voteChoices[Math.floor(Math.random() * G.voteChoices.length)];
-    if (G.votes.a && G.votes.b) { clearTimeout(G.voteTimer); finishVote(pickWinner(G.votes.a, G.votes.b)); }
-    return;
-  }
-  if (G.mode === 'host') checkHostVotes();
-}
-function checkHostVotes() {
-  if (G.votes.a && G.votes.b) {
-    clearTimeout(G.voteTimer);
-    var w = pickWinner(G.votes.a, G.votes.b);
-    net.send({ t: 'vote-result', location: w });
-    finishVote(w);
-  }
-}
-function pickWinner(a, b) { if (a === b) return a; return Math.random() < 0.5 ? a : b; }
-function finishVote(location) {
-  var vr = $('vote-result');
-  if (vr) { vr.textContent = '→ ' + getLocation(location).name; vr.classList.add('show'); }
-  setTimeout(function () {
-    if (vr) vr.classList.remove('show');
-    G.location = location;
-    startPlay();
-  }, 1200);
-}
-
-/* ============================================================
-   Сеть: обработчики
-   ============================================================ */
-net.onMessage = function (msg) {
-  if (!msg || !msg.t) return;
-  switch (msg.t) {
-    case 'error': toast(msg.text || 'Ошибка сети'); break;
-    case 'profile':
-      G.peerProfile = msg.profile;
-      if (G.mode === 'guest' && typeof msg.minigames === 'boolean') {
-        G.minigamesEnabled = msg.minigames;
-        var cb = $('chk-minigames'); if (cb) cb.checked = G.minigamesEnabled;
-      }
-      updateLobby();
-      break;
-    case 'vote-start':
-      if (G.mode === 'guest') { G.voteChoices = msg.choices; G.votes = { a: null, b: null }; clearTimeout(G.voteTimer); showVoteScreen(msg.choices); }
-      break;
-    case 'vote':
-      if (G.mode === 'host') { G.votes.b = msg.choice; checkHostVotes(); }
-      break;
-    case 'vote-result':
-      if (G.mode === 'guest') { clearTimeout(G.voteTimer); finishVote(msg.location); }
-      break;
-    case 'minigame-start':
-      if (G.mode === 'host') startMinigame(msg.id, msg.action, { role: 'host', owner: 'b' });
-      else if (G.mode === 'guest') startMinigame(msg.id, msg.action, { role: 'guest', owner: 'a' });
-      break;
-    case 'minigame-result':
-      G.peerResult = msg.ok ? 'win' : 'lose';
-      if (G.minigameCtx && G.minigameCtx.role === 'host') setTimeout(checkMinigameComplete, 300);
-      break;
-    case 'minigame-failed':
-      if (G.state === S.minigame) {
-        pushMessage('fail', 'Попытка не удалась.');
-        G.mood = Math.max(0, G.mood - 3);
-        G.thinking = false;
-        G.minigame = null; G.myResult = null; G.peerResult = null;
-        go(S.play); updateTurnUI();
-      }
-      break;
-    case 'action':
-      if (G.mode === 'host') {
-        pushMessage('b', msg.text);
-        G.thinking = true; updateTurnUI();
-        runAtmosphere().then(function () { G.turn = 'a'; G.thinking = false; net.send({ t: 'state', state: snapshotState() }); updateTurnUI(); });
-      }
-      break;
-    case 'state':
-      if (G.mode === 'guest') applyState(msg.state);
-      break;
-    case 'interact':
-      if (G.location === msg.loc) {
-        var idef = INTERACTIVES[msg.loc];
-        if (idef && idef.apply) idef.apply(msg.action, msg.data, G.locationState);
-      }
-      break;
-    case 'video-state':
-      if (G.mode === 'guest') applyVideoState(msg);
-      break;
-    case 'video-pause':
-      if (G.mode === 'guest' && G.video.active) {
-        if (G.video.kind !== 'youtube') {
-          try { G.video.el.currentTime = msg.time; G.video.el.pause(); } catch (e) {}
-        } else youtubeCmd('pauseVideo');
-      }
-      break;
-    case 'video-stop':
-      if (G.mode === 'guest') stopVideo(false);
-      break;
-    case 'audio-state':
-      if (G.mode === 'guest') applyAudioState(msg);
-      break;
-    case 'audio-stop':
-      if (G.mode === 'guest') stopAudio(false);
-      break;
-    case 'file-start':
-      incoming = { name: msg.name, type: msg.type, size: msg.size, total: msg.total, chunks: new Array(msg.total), received: 0 };
-      toast('Принимаю: ' + msg.name);
-      break;
-    case 'file-chunk':
-      if (incoming && msg.idx >= 0 && msg.idx < incoming.total) { incoming.chunks[msg.idx] = new Uint8Array(msg.data); incoming.received++; }
-      break;
-    case 'file-end':
-      if (incoming) {
-        var total = 0, ci;
-        for (ci = 0; ci < incoming.chunks.length; ci++) if (incoming.chunks[ci]) total += incoming.chunks[ci].length;
-        var merged = new Uint8Array(total), off = 0;
-        for (ci = 0; ci < incoming.chunks.length; ci++) if (incoming.chunks[ci]) { merged.set(incoming.chunks[ci], off); off += incoming.chunks[ci].length; }
-        playReceivedFile(new Blob([merged], { type: incoming.type }), incoming.type);
-        incoming = null;
-      }
-      break;
-    case 'over':
-      if (G.mode === 'guest') { G.over = msg.data; showOver(msg.data); }
-      break;
-  }
-};
-net.onOpen = function () {
-  net.send({ t: 'profile', profile: G.profile, minigames: G.minigamesEnabled });
-  if (G.mode === 'host') { var lc = $('lobby-code'); if (lc) lc.textContent = G.roomCode; }
-  updateLobby();
-};
-net.onClose = function () { if (G.state === S.play) pushMessage('sys', 'Связь потеряна.'); };
-
-function updateLobby() {
-  var host = G.mode === 'host' ? G.profile : G.peerProfile;
-  var guest = G.mode === 'host' ? G.peerProfile : G.profile;
-  var roster = $('lobby-roster'); if (!roster) return;
-  roster.innerHTML = '';
-  addSlot(host, 'Хост');
-  addSlot(guest, 'Гость');
-  var ready = !!(host && guest);
-  var b = $('btn-start'); if (b) b.disabled = G.mode !== 'host' || !ready;
-  var st = $('lobby-status');
-  if (st) st.textContent = ready ? (G.mode === 'host' ? 'Всё готово' : 'Ждём хоста…') : (G.mode === 'host' ? 'Ждём второго игрока…' : 'Подключено. Ждём хоста…');
-}
-function addSlot(prof, label) {
-  var roster = $('lobby-roster'); if (!roster) return;
-  var div = document.createElement('div');
-  div.className = 'slot' + (prof ? ' filled' : '');
-  if (prof) {
-    var cv = document.createElement('canvas');
-    cv.width = 16; cv.height = 24;
-    var c = cv.getContext('2d');
-    c.imageSmoothingEnabled = false;
-    drawAvatar(c, 0, 0, prof, { t: 0 });
-    div.appendChild(cv);
-    div.appendChild(document.createTextNode(prof.name || label));
-  } else div.textContent = label + '…';
-  roster.appendChild(div);
-}
-function startPlay() {
-  G.mood = 50; G.chemistry = 50;
-  G.history = []; G.turn = 'a'; G.thinking = false;
-  G.transition = 0; G.pendingLocation = null;
-  stopVideo(false); stopAudio(false);
-  var ln = $('loc-name'); if (ln) ln.textContent = getLocation(G.location).name;
-  pushMessage('sys', '— ' + getLocation(G.location).name + ' —');
-  resetLocationState();
-  renderLog(); updateTurnUI();
-  go('play');
-}
-
-function mgPointer(e, type) {
-  if (!G.minigame || !mgCanvas) return;
-  var rect = mgCanvas.getBoundingClientRect();
-  var x = (e.clientX - rect.left) / rect.width * 160;
-  var y = (e.clientY - rect.top) / rect.height * 200;
-  G.minigame.pointer(x, y, type);
-}
-if (mgCanvas) {
-  mgCanvas.addEventListener('pointerdown', function (e) { e.preventDefault(); mgPointer(e, 'down'); });
-  mgCanvas.addEventListener('pointermove', function (e) { if (e.buttons || e.pointerType === 'touch') mgPointer(e, 'move'); });
-  mgCanvas.addEventListener('pointerup', function (e) { e.preventDefault(); mgPointer(e, 'up'); });
-  mgCanvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
-}
-
-/* ============================================================
-   Telegram startapp / share
-   ============================================================ */
-function applyTGStartParam() {
-  var p = getStartParam();
-  if (!p) return false;
-  var code = String(p).toUpperCase().trim();
-  if (!/^[A-Z0-9]{4}$/.test(code)) return false;
-  var ic = $('inp-code'); if (ic) ic.value = code;
-  var js = $('join-status');
-  if (js) js.textContent = 'Хост поделился кодом ' + code + ' — жми «Войти»';
-  go('join');
-  return true;
-}
-
-function getBotDeepLink(code) {
-  if (!BOT_USERNAME) return null;
-  var base = 'https://t.me/' + BOT_USERNAME + (BOT_APPNAME ? '/' + BOT_APPNAME : '');
-  return base + '?startapp=' + code;
-}
-
-function shareRoomLink() {
-  var code = G.roomCode;
-  if (!code) return;
-  var deepLink = getBotDeepLink(code);
-  var text = 'Сыграем в «Атмосферу»?\nКод комнаты: ' + code;
-  var fullText = deepLink ? text + '\n' + deepLink : text;
-
-  if (TG && TG.openTelegramLink && deepLink) {
-    try {
-      TG.openTelegramLink('https://t.me/share/url?url=' + encodeURIComponent(deepLink) + '&text=' + encodeURIComponent('Сыграем в «Атмосферу»?'));
-      return;
-    } catch (e) {}
-  }
-  if (navigator.share) {
-    navigator.share({ title: 'Атмосфера', text: text, url: deepLink || undefined }).catch(function(){});
-    return;
-  }
-  if (navigator.clipboard) {
-    navigator.clipboard.writeText(fullText).then(function () { toast('Скопировано'); }).catch(function () { toast('Код: ' + code); });
-    return;
-  }
-  toast('Код: ' + code);
-}
-
-/* ============================================================
-   Кнопки
-   ============================================================ */
-safeOn('btn-host', 'onclick', function () {
-  G.mode = 'host'; G.myRole = 'a';
-  G.profile = randomProfile(DEFAULT_NAME);
-  buildCreator(); go('creator');
-  G._afterCreator = function () {
-    var code = makeCode();
-    G.roomCode = code;
-    var lc = $('lobby-code'); if (lc) lc.textContent = code;
-    updateLobby(); go('lobby');
-    net.host(code).then(function (ok) { if (!ok) { var s = $('lobby-status'); if (s) s.textContent = 'Мультиплеер недоступен.'; } });
-  };
-});
-safeOn('btn-solo', 'onclick', function () {
-  G.mode = 'solo'; G.myRole = 'a';
-  G.profile = randomProfile(DEFAULT_NAME);
-  G.peerProfile = randomProfile('Он/Она');
-  buildCreator(); go('creator');
-  G._afterCreator = function () { startVoting(); };
-});
-safeOn('btn-join', 'onclick', function () { G.mode = 'guest'; G.myRole = 'b'; go('join'); });
-safeOn('btn-join-go', 'onclick', function () {
-  var ic = $('inp-code');
-  var code = (ic && ic.value || '').toUpperCase().trim();
-  if (code.length !== 4) { toast('Нужен код из 4 символов'); return; }
-  var js = $('join-status'); if (js) js.textContent = 'Подключаемся…';
-  G.profile = randomProfile(DEFAULT_NAME);
-  buildCreator(); go('creator');
-  G._afterCreator = function () {
-    var lc = $('lobby-code'); if (lc) lc.textContent = code;
-    go('lobby'); updateLobby();
-    net.join(code).then(function (ok) { if (!ok) { var s = $('lobby-status'); if (s) s.textContent = 'Мультиплеер недоступен.'; } });
-  };
-});
-safeOn('btn-creator-done', 'onclick', function () {
-  if (!G.profile.name) G.profile.name = DEFAULT_NAME;
-  if (G._afterCreator) { var f = G._afterCreator; G._afterCreator = null; f(); }
-});
-safeOn('btn-creator-rand', 'onclick', function () { G.profile = randomProfile(G.profile.name || DEFAULT_NAME); buildCreator(); });
-safeOn('btn-start', 'onclick', function () { if (G.mode !== 'host') return; startVoting(); });
-safeOn('btn-share-room', 'onclick', function () { shareRoomLink(); });
-safeOn('btn-send', 'onclick', function () { var inp = $('inp-action'); if (inp) submitAction(inp.value); });
-var inpAction = $('inp-action');
-if (inpAction) inpAction.addEventListener('keydown', function (e) {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitAction(inpAction.value); }
-});
-safeOn('btn-ai-settings', 'onclick', function () { loadAISettings(); go('settings'); });
-safeOn('btn-save-ai', 'onclick', function () { saveAISettings(); });
-safeOn('btn-test-ai', 'onclick', function () { testAI(); });
-
-safeOn('btn-show-video', 'onclick', function () { var vp = $('video-picker'); if (vp) vp.click(); });
-safeOn('btn-show-link', 'onclick', function () {
-  var url = prompt('Ссылка на YouTube или прямой URL видео (mp4/webm):', '');
-  if (!url) return;
-  url = url.trim();
-  var ytId = parseYouTubeId(url);
-  if (ytId) {
-    startVideo('youtube', ytId, {}, true);
-    toast('Видео на экране. У партнёра включится.');
-  } else if (/^https?:\/\//i.test(url)) {
-    startVideo('url', url, {}, true);
-    toast('Видео на экране. Если не грузится — сайт блокирует встраивание.');
-  } else toast('Не похоже на ссылку');
-});
-safeOn('btn-show-track', 'onclick', function () { var ap = $('audio-picker'); if (ap) ap.click(); });
-safeOn('btn-stop-media', 'onclick', function () {
-  if (G.video.active) stopVideo(true);
-  if (G.audioState.active) stopAudio(true);
-});
-safeOn('video-picker', 'onchange', function (e) {
-  var f = e.target.files[0]; if (f) handleVideoFile(f); e.target.value = '';
-});
-safeOn('audio-picker', 'onchange', function (e) {
-  var f = e.target.files[0]; if (f) handleAudioFile(f); e.target.value = '';
-});
-
-Array.prototype.forEach.call(document.querySelectorAll('[data-back]'), function (btn) {
-  btn.onclick = function () {
-    net.close();
-    stopVideo(true); stopAudio(true);
-    G.mode = 'idle';
-    go(btn.dataset.back || 'menu');
-  };
-});
-
-/* ============================================================
-   Старт
-   ============================================================ */
-try {
-  drawLogo();
-  loadAISettings();
-  initMinigamesToggle();
-  G.audioEl = $('club-player');
-  if (!applyTGStartParam()) go('menu');
-  var bs = $('boot-status');
-  if (bs) setTimeout(function () { bs.style.display = 'none'; }, 800);
-} catch (e) {
-  showFatal('Ошибка инициализации:', (e && e.stack) || (e && e.message) || String(e));
-}
-requestAnimationFrame(function (t) { last = t; frame(t); });
-
-})();
+  G.audioState.wallStart = Date.now(); G.audioState.videoStart = 
