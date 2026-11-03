@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0d0d0d">
+<title>Атмосфера</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div id="boot-status" style="position:fixed;top:0;left:0;right:0;z-index:99999;padding:8px 12px;background:#4d6bfe;color:#fff;font:12px monospace;text-align:center">Загрузка…</div>
+<script>
+  (function(){
+    var shown = false;
+    function fatal(msg) {
+      if (shown) return; shown = true;
+      var el = document.getElementById('boot-status');
+      el.style.background = '#d02020'; el.style.padding = '12px 14px'; el.style.textAlign = 'left';
+      el.style.fontSize = '13px'; el.style.whiteSpace = 'pre-wrap';
+      el.style.maxHeight = '70vh'; el.style.overflow = 'auto';
+      el.textContent = 'ОШИБКА: ' + msg;
+    }
+    window.addEventListener('error', function(e){
+      if (e.target && e.target.tagName === 'SCRIPT') fatal('Не загрузился скрипт: ' + (e.target.src || '?'));
+      else if (e.message) fatal(e.message + (e.filename ? '\n' + e.filename + ':' + e.lineno : ''));
+    }, true);
+    window.addEventListener('unhandledrejection', function(e){
+      var r = e.reason; fatal('Promise reject: ' + (r && (r.message || r) || ''));
+    });
+  })();
+</script>
+
+<div id="app">
+
+  <section class="screen" id="scr-menu">
+    <div class="brand">
+      <canvas class="logo-pix" id="logo-pix" width="96" height="96"></canvas>
+      <h1>Атмосфера</h1>
+      <p class="sub">RP-свидание на двоих.<br>Ты пишешь действие — мир отвечает.</p>
+    </div>
+    <div class="stack">
+      <button class="btn primary" id="btn-host">Создать комнату</button>
+      <button class="btn" id="btn-join">Войти по коду</button>
+      <button class="btn ghost" id="btn-solo">Соло (потренироваться)</button>
+      <button class="btn ghost" id="btn-ai-settings">⚙ Настройки AI</button>
+    </div>
+    <label class="toggle-row">
+      <input type="checkbox" id="chk-minigames" checked>
+      <span>🎲 Мини-игры перед действиями</span>
+    </label>
+    <div class="hint">Перед действием — мини-игра. Оба проходят → действие срабатывает.</div>
+  </section>
+
+  <section class="screen" id="scr-join">
+    <h2>Код комнаты</h2>
+    <input id="inp-code" class="input big" inputmode="latin" autocomplete="off" placeholder="ABCD" maxlength="4">
+    <div class="stack">
+      <button class="btn primary" id="btn-join-go">Войти</button>
+      <button class="btn ghost" data-back="menu">Назад</button>
+    </div>
+    <div class="hint" id="join-status"></div>
+  </section>
+
+  <section class="screen" id="scr-creator">
+    <h2>Создай себя</h2>
+    <div class="creator-wrap">
+      <canvas id="cv-preview" width="96" height="144"></canvas>
+      <div class="creator-controls" id="creator-controls"></div>
+    </div>
+    <div class="stack">
+      <button class="btn primary" id="btn-creator-done">Готово</button>
+      <button class="btn ghost" id="btn-creator-rand">Случайно</button>
+      <button class="btn ghost" data-back="menu">Назад</button>
+    </div>
+  </section>
+
+  <section class="screen" id="scr-lobby">
+    <h2>Комната</h2>
+    <div class="card">
+      <div class="label">Код для друга</div>
+      <div class="code" id="lobby-code">····</div>
+      <div class="hint">Пусть друг откроет игру и введёт этот код.</div>
+    </div>
+    <div class="roster" id="lobby-roster"></div>
+    <div class="stack">
+      <button class="btn primary" id="btn-start" disabled>Начать</button>
+      <button class="btn" id="btn-share-room">📤 Поделиться кодом</button>
+      <button class="btn ghost" data-back="menu">Выйти</button>
+    </div>
+    <div class="hint" id="lobby-status">Ждём второго игрока…</div>
+  </section>
+
+  <section class="screen" id="scr-vote">
+    <h2>Куда пойдём?</h2>
+    <div class="hint" id="vote-status">Выбери локацию</div>
+    <div class="vote-grid" id="vote-choices"></div>
+    <div class="vote-result" id="vote-result"></div>
+  </section>
+
+  <section class="screen" id="scr-play">
+    <div class="topbar">
+      <div class="loc" id="loc-name">Кафе</div>
+      <div class="turn" id="turn-label">Ход: —</div>
+    </div>
+    <div class="stage">
+      <div class="stage-inner">
+        <canvas id="cv-scene" width="160" height="100"></canvas>
+        <div class="cinema-overlay" id="cinema-overlay"></div>
+      </div>
+    </div>
+    <div class="interactive-bar" id="interactive-bar">
+      <button class="btn-ctx" id="btn-show-video" style="display:none">🎬 Файл</button>
+      <button class="btn-ctx" id="btn-show-link" style="display:none">🔗 Ссылка</button>
+      <button class="btn-ctx" id="btn-show-track" style="display:none">🎵 Трек</button>
+      <button class="btn-ctx" id="btn-stop-media" style="display:none">⏹ Остановить</button>
+    </div>
+    <div class="media-status" id="media-status"></div>
+    <div class="log" id="log"></div>
+    <div class="composer">
+      <textarea id="inp-action" rows="2" placeholder="Что ты делаешь?"></textarea>
+      <button class="btn primary send" id="btn-send" disabled>→</button>
+    </div>
+    <div class="hint" id="play-status"></div>
+  </section>
+
+  <section class="screen" id="scr-minigame">
+    <h2 id="minigame-title">Мини-игра</h2>
+    <div class="hint" id="minigame-hint">—</div>
+    <div class="stage">
+      <canvas id="cv-minigame" width="160" height="200"></canvas>
+    </div>
+    <div class="mg-result" id="minigame-result"></div>
+  </section>
+
+  <section class="screen" id="scr-over">
+    <h2 id="over-title">Конец</h2>
+    <div class="card">
+      <div class="epilogue" id="over-epilogue"></div>
+    </div>
+    <div class="stats" id="over-stats"></div>
+    <div class="stack">
+      <button class="btn primary" data-back="menu">Ещё раз</button>
+    </div>
+  </section>
+
+  <section class="screen" id="scr-settings">
+    <h2>Настройки «Атмосферы»</h2>
+    <p class="hint" style="text-align:left">Ключ нужен только тому, кто создаёт комнату.</p>
+    <div class="stack">
+      <label class="hint" style="text-align:left">API-ключ OpenRouter</label>
+      <input id="inp-apikey" class="input" type="password" autocomplete="off" placeholder="sk-or-v1-...">
+      <label class="hint" style="text-align:left">Модель</label>
+      <input id="inp-model" class="input" list="model-list" placeholder="openrouter/free">
+      <datalist id="model-list">
+        <option value="openrouter/free"></option>
+        <option value="nvidia/nemotron-3-ultra-550b-a55b:free"></option>
+        <option value="qwen/qwen3.8-27b:free"></option>
+        <option value="minimax/minimax-m3:free"></option>
+        <option value="meta-llama/llama-3.3-70b-instruct:free"></option>
+      </datalist>
+      <button class="btn primary" id="btn-save-ai">Сохранить</button>
+      <button class="btn ghost" id="btn-test-ai">Проверить соединение</button>
+      <button class="btn ghost" data-back="menu">Назад</button>
+    </div>
+    <div class="hint" id="settings-status"></div>
+  </section>
+
+</div>
+
+<div id="toast" class="toast"></div>
+
+<audio id="club-player" controls></audio>
+
+<input type="file" id="video-picker" accept="video/*" style="display:none">
+<input type="file" id="audio-picker" accept="audio/*" style="display:none">
+
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script async src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="src/game.js"></script>
+</body>
+</html>
